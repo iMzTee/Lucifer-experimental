@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+build/
+*.pyd
+*.exp
+*.lib
+*.obj
+Checkpoints_2v2/
+temp/
+logs/
+wandb/
+collision_meshes/
+.claude/
+lucifer_training.log
+curriculum_state.json
