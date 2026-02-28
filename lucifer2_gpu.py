@@ -80,11 +80,6 @@ def _amp_learn(self, exp):
     mean_val_loss = 0
     clip_fractions = []
 
-    policy_before = torch.nn.utils.parameters_to_vector(
-        self.policy.parameters()).cpu()
-    critic_before = torch.nn.utils.parameters_to_vector(
-        self.value_net.parameters()).cpu()
-
     t1 = time.time()
     for epoch in range(self.n_epochs):
         batches = exp.get_all_batches_shuffled(self.batch_size)
@@ -147,9 +142,6 @@ def _amp_learn(self, exp):
     mean_val_loss /= n_minibatch_iterations
     mean_clip = np.mean(clip_fractions) if clip_fractions else 0
 
-    policy_after = torch.nn.utils.parameters_to_vector(self.policy.parameters()).cpu()
-    critic_after = torch.nn.utils.parameters_to_vector(self.value_net.parameters()).cpu()
-
     self.cumulative_model_updates += n_iterations
 
     return {
@@ -159,8 +151,6 @@ def _amp_learn(self, exp):
         "Mean KL Divergence": mean_divergence,
         "Value Function Loss": mean_val_loss,
         "SB3 Clip Fraction": mean_clip,
-        "Policy Update Magnitude": (policy_before - policy_after).norm().item(),
-        "Value Function Update Magnitude": (critic_before - critic_after).norm().item(),
     }
 
 
@@ -309,8 +299,6 @@ class GPULearner:
                 t1 = time.time()
                 report = ppo.learn(buffer)
                 buffer.clear()
-                gc.collect()
-                torch.cuda.empty_cache()
                 meta['t_train'] = time.time() - t1
                 meta['nan_found'] = False
                 for name, param in ppo.policy.named_parameters():
@@ -365,13 +353,13 @@ class GPULearner:
         print("=" * 55)
         print(f"  Total Steps       : {cumul_steps:,}")
         print(f"  Steps Collected   : {steps_gained:,}")
-        print(f"  Iter Time         : {wall_time:.2f}s  (collect: {t_coll:.1f}s  train: {t_train:.1f}s)")
+        t_wait = meta.get('t_wait', 0)
+        print(f"  Iter Time         : {wall_time:.2f}s  (collect: {t_coll:.1f}s  train: {t_train:.1f}s  wait: {t_wait:.1f}s)")
         print(f"  Global SPS        : {sps:,}")
         print(f"  Mean Reward       : {mean_reward:.6f}")
         print(f"  Entropy           : {entropy:.4f}")
         print(f"  Clip Fraction     : {clip:.4f}")
         print(f"  Value Loss        : {value_loss:.4f}")
-        print(f"  Policy Upd. Mag.  : {report.get('Policy Update Magnitude', 0):.6f}")
         print(f"  Stage Iter Count  : {self.curriculum.stage_iter_count}")
         print("=" * 55)
         log_memory_usage("post-training")
@@ -412,11 +400,11 @@ class GPULearner:
             self._finalize_prev_iteration(prev_report, prev_meta)
 
         # 4. Sync frozen policy
+        t_sync = time.time()
         self._frozen_policy.load_state_dict(self.ppo_learner.policy.state_dict())
-        gc.collect()
-        torch.cuda.empty_cache()
 
         # 5. Compute GAE
+        t_gae = time.time()
         states, actions, log_probs, rewards, next_states, dones, truncated = exp
         val_all = np.vstack([states, next_states[-1:]])
         val_chunks = []
@@ -429,8 +417,6 @@ class GPULearner:
             del chunk
         val_preds = np.concatenate(val_chunks)
         del val_chunks, val_all
-        gc.collect()
-        torch.cuda.empty_cache()
 
         rewards_arr = np.array(rewards)
         rewards_std = rewards_arr.std()
@@ -444,13 +430,23 @@ class GPULearner:
             rewards_norm, dones, truncated, np.nan_to_num(val_preds))
 
         # 6. Experience buffer
+        t_buf = time.time()
         buffer = rlgym_ppo.ppo.ExperienceBuffer(
             max_size=self.ts_per_iteration + 20000, device="cpu", seed=123)
         buffer.submit_experience(
             states, actions, log_probs, rewards_norm, next_states, dones, truncated, vt, adv)
+        mean_reward = float(rewards_arr.mean())
         del states, actions, log_probs, rewards_norm, next_states, dones, truncated, vt, adv
         del rewards_arr, rewards_std, val_preds, exp
+        t_buf_end = time.time()
+
+        # Single cleanup pass (not 3x per iter)
         gc.collect()
+        torch.cuda.empty_cache()
+
+        t_overhead = time.time()
+        print(f"[*] Overhead: sync={t_gae-t_sync:.2f}s  GAE={t_buf-t_gae:.2f}s  "
+              f"buf={t_buf_end-t_buf:.2f}s  gc={t_overhead-t_buf_end:.2f}s")
 
         # 7. Launch training in background
         self.epoch += 1
@@ -458,7 +454,8 @@ class GPULearner:
             'epoch': self.epoch,
             'steps_gained': steps_gained,
             't_coll': t_coll,
-            'mean_reward': float(np.mean(rewards)),
+            't_wait': t_wait,
+            'mean_reward': mean_reward,
             'cumul_steps': self.agent.cumulative_timesteps,
             'iter_start': iter_start,
         }
