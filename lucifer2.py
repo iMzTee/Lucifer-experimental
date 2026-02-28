@@ -812,8 +812,8 @@ class Learner:
         if self.curriculum.update(mean_reward, entropy, clip, value_loss):
             save_curriculum_state(self.curriculum.to_state_dict())
             print(f"\n[CURRICULUM] {self.curriculum.restart_reason}")
-            print(f"[CURRICULUM] Saving checkpoint before restart...")
-            self.save_checkpoint(f"lucifer_curriculum_s{self.curriculum.stage}_epoch_{epoch}")
+            print(f"[CURRICULUM] Saving stage transition checkpoint...")
+            self.save_stage_checkpoint(self.curriculum.stage, epoch)
             self._restart()
 
         # Historical policy pool save (Phase 4)
@@ -930,6 +930,18 @@ class Learner:
 
         log_memory_usage("training-launched")
 
+    def save_stage_checkpoint(self, stage, epoch):
+        """Save a stage transition checkpoint that is never pruned."""
+        stage_dir = os.path.join(self.checkpoints_folder, "stage_backups")
+        os.makedirs(stage_dir, exist_ok=True)
+        label = f"stage_{stage}_epoch_{epoch}"
+        path = os.path.join(stage_dir, label)
+        os.makedirs(path, exist_ok=True)
+        self.ppo_learner.save_to(path)
+        with open(os.path.join(path, "VARS.json"), "w") as f:
+            json.dump({"steps": self.agent.cumulative_timesteps, "epoch": self.epoch, "stage": stage}, f)
+        print(f"[*] Stage transition checkpoint saved: stage_backups/{label}")
+
     def save_checkpoint(self, label):
         path = os.path.join(self.checkpoints_folder, label)
         os.makedirs(path, exist_ok=True)
@@ -940,7 +952,7 @@ class Learner:
         import shutil
         all_ckpts = sorted([
             d for d in os.listdir(self.checkpoints_folder)
-            if os.path.isdir(os.path.join(self.checkpoints_folder, d))
+            if os.path.isdir(os.path.join(self.checkpoints_folder, d)) and d != "stage_backups"
         ], key=lambda d: os.path.getmtime(os.path.join(self.checkpoints_folder, d)))
         while len(all_ckpts) > 3:
             oldest = all_ckpts.pop(0)
@@ -951,7 +963,7 @@ class Learner:
     def load_latest_checkpoint(self):
         if not os.path.exists(self.checkpoints_folder): return
         potential = [d for d in os.listdir(self.checkpoints_folder)
-                     if os.path.isdir(os.path.join(self.checkpoints_folder, d))]
+                     if os.path.isdir(os.path.join(self.checkpoints_folder, d)) and d != "stage_backups"]
         if potential:
             latest = sorted(potential, key=lambda d: os.path.getmtime(
                 os.path.join(self.checkpoints_folder, d)))[-1]
