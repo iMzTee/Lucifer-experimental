@@ -403,20 +403,16 @@ class GPULearner:
         t_sync = time.time()
         self._frozen_policy.load_state_dict(self.ppo_learner.policy.state_dict())
 
-        # 5. Compute GAE
+        # 5. Compute GAE — single GPU pass for all value predictions
         t_gae = time.time()
         states, actions, log_probs, rewards, next_states, dones, truncated = exp
-        val_all = np.vstack([states, next_states[-1:]])
-        val_chunks = []
-        VAL_CHUNK = 20000
-        for ci in range(0, len(val_all), VAL_CHUNK):
-            chunk = torch.as_tensor(val_all[ci:ci+VAL_CHUNK],
-                                     dtype=torch.float32, device=self.device)
-            with torch.no_grad():
-                val_chunks.append(self.ppo_learner.value_net(chunk).cpu().flatten().numpy())
-            del chunk
-        val_preds = np.concatenate(val_chunks)
-        del val_chunks, val_all
+        # One big transfer + forward pass instead of 10 small round-trips
+        val_input = torch.as_tensor(
+            np.vstack([states, next_states[-1:]]),
+            dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            val_preds = self.ppo_learner.value_net(val_input).cpu().flatten().numpy()
+        del val_input
 
         rewards_arr = np.array(rewards)
         rewards_std = rewards_arr.std()
