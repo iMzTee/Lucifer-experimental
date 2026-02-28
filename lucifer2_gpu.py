@@ -294,9 +294,9 @@ class GPULearner:
 
         # torch.compile the neural networks for faster inference + training
         try:
-            self.ppo_learner.policy = torch.compile(self.ppo_learner.policy, mode='reduce-overhead')
-            self.ppo_learner.value_net = torch.compile(self.ppo_learner.value_net, mode='reduce-overhead')
-            print("[*] torch.compile enabled on policy + value net (reduce-overhead)")
+            self.ppo_learner.policy = torch.compile(self.ppo_learner.policy, mode='max-autotune')
+            self.ppo_learner.value_net = torch.compile(self.ppo_learner.value_net, mode='max-autotune')
+            print("[*] torch.compile enabled on policy + value net (max-autotune)")
         except Exception as e:
             print(f"[!] torch.compile failed, continuing without: {e}")
 
