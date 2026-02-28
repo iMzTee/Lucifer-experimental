@@ -83,6 +83,7 @@ class GPUCollector:
 
         # Previous actions (on GPU)
         self._prev_actions = torch.zeros(n_envs, 4, 8, device=device)
+        self._controls = torch.zeros(n_envs, 4, 8, device=device)
 
         # Current observation (on GPU)
         self._current_obs = torch.zeros(self.total_agents, self.obs_size, device=device)
@@ -157,14 +158,13 @@ class GPUCollector:
             # actions_t: (E*4, 8) integer tensor from MultiDiscrete
             # Convert: first 5 dims subtract 1 to get [-1, 0, 1], last 3 are {0, 1}
             actions_float = actions_t.float()
-            controls = torch.zeros(self.n_envs, 4, 8, device=self.device)
             actions_reshaped = actions_float.reshape(self.n_envs, 4, 8)
-            controls[:, :, :5] = actions_reshaped[:, :, :5] - 1.0
-            controls[:, :, 5:] = actions_reshaped[:, :, 5:]
-            self._prev_actions = controls.clone()
+            self._controls[:, :, :5] = actions_reshaped[:, :, :5] - 1.0
+            self._controls[:, :, 5:] = actions_reshaped[:, :, 5:]
+            self._prev_actions.copy_(self._controls)
 
             # ── 4. Step environment ──
-            terminals = self.env.step(controls)
+            terminals = self.env.step(self._controls)
 
             # ── 5. Compute rewards ──
             rewards_batch = self.rewards.compute(self.env.state, self._stage)  # (E, 4)
@@ -227,25 +227,22 @@ class GPUCollector:
         # Mark last round non-done transitions as truncated (for GAE)
         last_round_start = actual - n_total
         if last_round_start >= 0:
-            for i in range(self.n_envs):
-                base = last_round_start + i * self.n_agents
-                if base < actual and all_dones[base] == 0:
-                    for j in range(self.n_agents):
-                        if base + j < actual:
-                            all_truncated[base + j] = 1.0
+            last_dones = all_dones[last_round_start:actual].reshape(self.n_envs, self.n_agents)
+            last_trunc = all_truncated[last_round_start:actual].reshape(self.n_envs, self.n_agents)
+            last_trunc[last_dones[:, 0] == 0] = 1.0
 
         self.cumulative_timesteps += actual
         elapsed = time.time() - t0
 
-        # ── Move to CPU as numpy (compatible with existing PPO learner) ──
+        # ── Return GPU tensors directly (no CPU transfer) ──
         exp = (
-            all_states.cpu().numpy().astype('float32'),
-            all_actions.cpu().numpy().astype('float32'),
-            all_log_probs.cpu().numpy().astype('float32'),
-            all_rewards.cpu().numpy().astype('float32'),
-            all_next_states.cpu().numpy().astype('float32'),
-            all_dones.cpu().numpy().astype('float32'),
-            all_truncated.cpu().numpy().astype('float32'),
+            all_states,
+            all_actions,
+            all_log_probs,
+            all_rewards,
+            all_next_states,
+            all_dones,
+            all_truncated,
         )
 
         return exp, [], actual, elapsed

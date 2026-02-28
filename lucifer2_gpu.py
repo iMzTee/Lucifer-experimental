@@ -26,6 +26,19 @@ import rlgym_ppo.util as rlgym_util
 from gpu_sim.collector import GPUCollector
 from gpu_sim.constants import STAGE_CONFIG
 
+
+# ─── GPU batch shuffling (avoids numpy→GPU index transfer) ───
+def _gpu_get_all_batches_shuffled(self, batch_size):
+    total_samples = self.rewards.shape[0]
+    indices = torch.randperm(total_samples, device=self.rewards.device)
+    start_idx = 0
+    while start_idx + batch_size <= total_samples:
+        yield self._get_samples(indices[start_idx:start_idx + batch_size])
+        start_idx += batch_size
+
+rlgym_ppo.ppo.ExperienceBuffer.get_all_batches_shuffled = _gpu_get_all_batches_shuffled
+
+
 # ─── Curriculum state persistence ───
 CURRICULUM_STATE_FILE = "curriculum_state.json"
 CURRICULUM_STAGE_NAMES = ["Foundations", "Game Play", "Mechanics", "Mastery"]
@@ -403,48 +416,72 @@ class GPULearner:
         t_sync = time.time()
         self._frozen_policy.load_state_dict(self.ppo_learner.policy.state_dict())
 
-        # 5. Compute GAE — chunked value predictions (50k chunks = 4 round-trips)
+        # 5. GPU GAE — value predictions + advantage estimation on GPU
         t_gae = time.time()
         states, actions, log_probs, rewards, next_states, dones, truncated = exp
-        n_samples = len(states) + 1  # states + 1 bootstrap value
-        val_preds = np.empty(n_samples, dtype=np.float32)
+        n_steps = states.shape[0]
+        n_agents = self.agent.total_agents
+        n_rounds = n_steps // n_agents
         VAL_CHUNK = 50000
-        with torch.no_grad():
-            # Value predictions for all states
-            for ci in range(0, len(states), VAL_CHUNK):
-                end = min(ci + VAL_CHUNK, len(states))
-                chunk_gpu = torch.as_tensor(states[ci:end],
-                                             dtype=torch.float32, device=self.device)
-                val_preds[ci:end] = self.ppo_learner.value_net(chunk_gpu).cpu().flatten().numpy()
-            # Bootstrap value (single sample)
-            boot_gpu = torch.as_tensor(next_states[-1:],
-                                        dtype=torch.float32, device=self.device)
-            val_preds[-1] = self.ppo_learner.value_net(boot_gpu).cpu().item()
 
-        rewards_arr = np.array(rewards)
-        rewards_std = rewards_arr.std()
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            # Value predictions for all states (stay on GPU)
+            val_states = torch.empty(n_steps, device='cuda')
+            for ci in range(0, n_steps, VAL_CHUNK):
+                end = min(ci + VAL_CHUNK, n_steps)
+                val_states[ci:end] = self.ppo_learner.value_net(states[ci:end]).flatten()
+            # Bootstrap values for last round's next states
+            boot_next = next_states[-n_agents:]
+            boot_vals = torch.empty(n_agents, device='cuda')
+            for ci in range(0, n_agents, VAL_CHUNK):
+                end = min(ci + VAL_CHUNK, n_agents)
+                boot_vals[ci:end] = self.ppo_learner.value_net(boot_next[ci:end]).flatten()
+
+        # All values as float32: (n_rounds+1, n_agents)
+        values = torch.cat([val_states, boot_vals]).float().reshape(n_rounds + 1, n_agents)
+        values = torch.nan_to_num(values)
+        del val_states, boot_vals
+
+        # Reward normalization on GPU
+        mean_reward = float(rewards.mean().item())
+        rewards_std = rewards.std()
         if rewards_std > 1e-6:
-            rewards_norm = (rewards_arr - rewards_arr.mean()) / (rewards_std + 1e-8)
-            rewards_norm = np.clip(rewards_norm, -10.0, 10.0)
+            rewards_norm = ((rewards - rewards.mean()) / (rewards_std + 1e-8)).clamp(-10.0, 10.0)
         else:
-            rewards_norm = rewards_arr - rewards_arr.mean()
+            rewards_norm = rewards - rewards.mean()
 
-        vt, adv, _ = rlgym_util.torch_functions.compute_gae(
-            rewards_norm, dones, truncated, np.nan_to_num(val_preds))
+        # Reshape experience for vectorized GAE
+        r = rewards_norm.reshape(n_rounds, n_agents)
+        d = dones.reshape(n_rounds, n_agents)
+        tr = truncated.reshape(n_rounds, n_agents)
 
-        # 6. Experience buffer
+        # Vectorized GAE: n_rounds iterations instead of 200k
+        gamma, lam = 0.99, 0.95
+        gae = torch.zeros(n_agents, device='cuda')
+        advantages = torch.empty(n_rounds, n_agents, device='cuda')
+        for t in reversed(range(n_rounds)):
+            not_done = 1.0 - d[t]
+            continuation = not_done * (1.0 - tr[t])
+            delta = r[t] + gamma * values[t + 1] * not_done - values[t]
+            gae = delta + gamma * lam * continuation * gae
+            advantages[t] = gae
+
+        vt = (values[:n_rounds] + advantages).reshape(-1)
+        adv = advantages.reshape(-1)
+        del values, r, d, tr, gae, advantages
+
+        # 6. GPU experience buffer (no CPU transfer)
         t_buf = time.time()
         buffer = rlgym_ppo.ppo.ExperienceBuffer(
-            max_size=self.ts_per_iteration + 20000, device="cpu", seed=123)
+            max_size=self.ts_per_iteration + 20000, device="cuda", seed=123)
         buffer.submit_experience(
             states, actions, log_probs, rewards_norm, next_states, dones, truncated, vt, adv)
-        mean_reward = float(rewards_arr.mean())
-        del states, actions, log_probs, rewards_norm, next_states, dones, truncated, vt, adv
-        del rewards_arr, rewards_std, val_preds, exp
+        del states, actions, log_probs, rewards, rewards_norm, next_states, dones, truncated, vt, adv, exp
         t_buf_end = time.time()
 
-        # Single cleanup pass (not 3x per iter)
-        gc.collect()
+        # GC only every 10 iterations
+        if self.epoch % 10 == 0:
+            gc.collect()
         torch.cuda.empty_cache()
 
         t_overhead = time.time()
