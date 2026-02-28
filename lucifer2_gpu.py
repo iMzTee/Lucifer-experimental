@@ -552,9 +552,8 @@ class GPULearner:
 
 if __name__ == "__main__":
     # ── Configuration ──
-    # Start conservative: 10,000 envs on RTX 2060 (6GB VRAM)
-    # Increase to 25,000 or 50,000 once VRAM usage is confirmed
-    N_ENVS = 10000
+    # 40k envs: ~78k SPS on RTX 2060 (6GB), peak ~4.2GB VRAM
+    N_ENVS = 40000
     TS_PER_ITERATION = 200000
 
     print(f"\n[*] LUCIFER GPU SIMULATOR")
