@@ -491,17 +491,17 @@ def env_factory():
 class CurriculumTracker:
     """
     Tracks training metrics and manages:
-      1. Stage advancement — purely entropy-based: advance only when entropy
-         drops below floor for ENTROPY_CONSECUTIVE iterations.
+      1. Stage advancement — requires BOTH minimum iterations in the current
+         stage AND entropy below floor for ENTROPY_CONSECUTIVE iterations.
       2. Clip fraction management — reduce policy_lr if updates are too large.
 
-    No step-based fallback — the bot must actually learn before advancing.
     4 stages: Foundations → Game Play → Mechanics → Mastery
     """
 
     # Entropy floors for advancement: when entropy drops below, advance
-    ENTROPY_ADVANCE     = [1.5, 1.2, 1.0]        # Stage 0→1, 1→2, 2→3
+    ENTROPY_ADVANCE     = [1.5, 1.3, 1.0]        # Stage 0→1, 1→2, 2→3
     ENTROPY_CONSECUTIVE = 10                      # consecutive iters below floor
+    MIN_STAGE_ITERS     = [500, 2000, 2500]       # minimum iters per stage before advancing
 
     CLIP_HIGH_THRESH    = 0.25
     CLIP_HIGH_ITERS     = 5
@@ -549,15 +549,18 @@ class CurriculumTracker:
                 self.restart_requested = True
                 return True
 
-        # 2. STAGE ADVANCEMENT — purely entropy-based (no fallback)
+        # 2. STAGE ADVANCEMENT — entropy + minimum iteration gate
         if self.stage < 3:
             floor = self.ENTROPY_ADVANCE[self.stage]
+            min_iters = self.MIN_STAGE_ITERS[self.stage]
+
             if entropy < floor:
                 self.entropy_low_count += 1
             else:
                 self.entropy_low_count = 0
 
-            if self.entropy_low_count >= self.ENTROPY_CONSECUTIVE:
+            if (self.entropy_low_count >= self.ENTROPY_CONSECUTIVE
+                    and self.stage_iter_count >= min_iters):
                 old_stage = self.stage
                 self.stage += 1
                 self.stage_iter_count = 0
@@ -565,9 +568,16 @@ class CurriculumTracker:
                 self.restart_reason = (
                     f"STAGE ADVANCE {old_stage} → {self.stage} "
                     f"({CURRICULUM_STAGE_NAMES[self.stage]}): "
-                    f"Entropy {entropy:.2f} < {floor} for {self.ENTROPY_CONSECUTIVE} iters")
+                    f"Entropy {entropy:.2f} < {floor} for {self.ENTROPY_CONSECUTIVE} iters "
+                    f"after {self.stage_iter_count} stage iters")
                 self.restart_requested = True
                 return True
+
+            if self.stage_iter_count % 100 == 0:
+                print(f"[CURRICULUM] Stage {self.stage} progress: "
+                      f"iter {self.stage_iter_count}/{min_iters}, "
+                      f"entropy {entropy:.2f} (floor {floor}), "
+                      f"low_count {self.entropy_low_count}/{self.ENTROPY_CONSECUTIVE}")
 
         return False
 
