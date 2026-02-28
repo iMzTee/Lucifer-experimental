@@ -283,6 +283,14 @@ class GPULearner:
         self.ppo_learner.learn = types.MethodType(_amp_learn, self.ppo_learner)
         print("[*] AMP mixed-precision training enabled")
 
+        # torch.compile the neural networks for faster inference + training
+        try:
+            self.ppo_learner.policy = torch.compile(self.ppo_learner.policy, mode='reduce-overhead')
+            self.ppo_learner.value_net = torch.compile(self.ppo_learner.value_net, mode='reduce-overhead')
+            print("[*] torch.compile enabled on policy + value net (reduce-overhead)")
+        except Exception as e:
+            print(f"[!] torch.compile failed, continuing without: {e}")
+
         # Pipeline parallelism: frozen policy copy for collection
         # In GPU sim, frozen copy stays on GPU (same device)
         self._frozen_policy = deepcopy(self.ppo_learner.policy)

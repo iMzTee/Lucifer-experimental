@@ -11,8 +11,14 @@ import json
 import os
 from .environment import GPUEnvironment
 from .rewards import GPURewards
-from .observations import build_obs_batch
+from .observations import build_obs_batch as _build_obs_batch
 from .constants import STAGE_CONFIG
+
+# Try to compile the obs builder (pure tensor math, ideal for torch.compile)
+try:
+    build_obs_batch = torch.compile(_build_obs_batch, mode='reduce-overhead')
+except Exception:
+    build_obs_batch = _build_obs_batch
 
 
 class WelfordRunningStatGPU:
