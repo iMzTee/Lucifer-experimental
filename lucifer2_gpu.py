@@ -283,6 +283,15 @@ class GPULearner:
         self.ppo_learner.learn = types.MethodType(_amp_learn, self.ppo_learner)
         print("[*] AMP mixed-precision training enabled")
 
+        # Background training state
+        self._training_thread = None
+        self._training_report = None
+        self._training_meta = None
+        self._training_exception = None
+
+        # Load checkpoint BEFORE torch.compile (compiled models can't load_state_dict)
+        self.load_latest_checkpoint()
+
         # torch.compile the neural networks for faster inference + training
         try:
             self.ppo_learner.policy = torch.compile(self.ppo_learner.policy, mode='reduce-overhead')
@@ -296,16 +305,6 @@ class GPULearner:
         self._frozen_policy = deepcopy(self.ppo_learner.policy)
         self._frozen_policy.eval()
         self.agent.policy = self._frozen_policy
-
-        # Background training state
-        self._training_thread = None
-        self._training_report = None
-        self._training_meta = None
-        self._training_exception = None
-
-        self.load_latest_checkpoint()
-        # Sync frozen policy with loaded checkpoint
-        self._frozen_policy.load_state_dict(self.ppo_learner.policy.state_dict())
 
         log_memory_usage("init-complete")
 
