@@ -292,13 +292,7 @@ class GPULearner:
         # Load checkpoint BEFORE torch.compile (compiled models can't load_state_dict)
         self.load_latest_checkpoint()
 
-        # torch.compile the neural networks for faster inference + training
-        try:
-            self.ppo_learner.policy = torch.compile(self.ppo_learner.policy, mode='max-autotune')
-            self.ppo_learner.value_net = torch.compile(self.ppo_learner.value_net, mode='max-autotune')
-            print("[*] torch.compile enabled on policy + value net (max-autotune)")
-        except Exception as e:
-            print(f"[!] torch.compile failed, continuing without: {e}")
+        # torch.compile disabled — CUDAGraphs conflicts with tensor reuse in collection loop
 
         # Pipeline parallelism: frozen policy copy for collection
         # In GPU sim, frozen copy stays on GPU (same device)
