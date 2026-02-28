@@ -265,15 +265,17 @@ def update_demoed_cars(state, dt=DT):
 
     if respawn_blue.any():
         n = respawn_blue.sum().item()
-        state.car_pos[respawn_blue] = torch.tensor([0.0, -2500.0, 17.0], device=state.device)
-        state.car_pos[respawn_blue, 0] += torch.rand(n, device=state.device) * 200 - 100
+        pos = torch.tensor([0.0, -2500.0, 17.0], device=state.device).expand(n, -1).clone()
+        pos[:, 0] += torch.rand(n, device=state.device) * 200 - 100
+        state.car_pos[respawn_blue] = pos
         state.car_vel[respawn_blue] = 0.0
         state.car_ang_vel[respawn_blue] = 0.0
 
     if respawn_orange.any():
         n = respawn_orange.sum().item()
-        state.car_pos[respawn_orange] = torch.tensor([0.0, 2500.0, 17.0], device=state.device)
-        state.car_pos[respawn_orange, 0] += torch.rand(n, device=state.device) * 200 - 100
+        pos = torch.tensor([0.0, 2500.0, 17.0], device=state.device).expand(n, -1).clone()
+        pos[:, 0] += torch.rand(n, device=state.device) * 200 - 100
+        state.car_pos[respawn_orange] = pos
         state.car_vel[respawn_orange] = 0.0
         state.car_ang_vel[respawn_orange] = 0.0
 
