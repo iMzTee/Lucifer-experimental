@@ -3,46 +3,66 @@
 Extracts a single env from TensorState, builds the JSON packet
 matching RocketSimVis protocol, and sends over UDP to localhost:9273.
 
+Uses a background thread to re-send the last known state at ~30fps,
+preventing RocketSimVis from extrapolating during training pauses.
+
 Zero overhead when disabled (no socket, no CPU transfers).
 """
 
 import socket
 import json
+import threading
+import time
 
 
 class VisSender:
     """Sends game state to RocketSimVis over UDP.
 
+    A background thread continuously re-sends the last snapshot at ~30fps
+    so the viewer doesn't drift objects using stale velocities between
+    physics bursts.
+
     Args:
         env_idx: Which environment index to visualize (default 0).
         enabled: If False, all methods are no-ops (zero overhead).
-        send_interval: Send every N-th call to avoid flooding the renderer.
         port: UDP port for RocketSimVis (default 9273).
     """
 
-    def __init__(self, env_idx=0, enabled=False, send_interval=4, port=9273):
+    def __init__(self, env_idx=0, enabled=False, port=9273):
         self.env_idx = env_idx
         self.enabled = enabled
-        self.send_interval = max(1, send_interval)
         self.port = port
-        self._call_count = 0
         self._sock = None
+        self._last_packet = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
 
         if enabled:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._addr = ("127.0.0.1", port)
+            self._thread = threading.Thread(target=self._send_loop, daemon=True)
+            self._thread.start()
+
+    def _send_loop(self):
+        """Background thread: re-send last known state at ~30fps."""
+        while not self._stop.is_set():
+            with self._lock:
+                packet_bytes = self._last_packet
+            if packet_bytes is not None:
+                try:
+                    self._sock.sendto(packet_bytes, self._addr)
+                except OSError:
+                    pass
+            self._stop.wait(1.0 / 30)
 
     def send(self, state):
-        """Send a single env's state to RocketSimVis.
+        """Snapshot a single env's state for the background sender.
 
         Args:
             state: TensorState from GPUEnvironment.
         """
         if not self.enabled:
-            return
-
-        self._call_count += 1
-        if self._call_count % self.send_interval != 0:
             return
 
         i = self.env_idx
@@ -83,12 +103,15 @@ class VisSender:
             "boost_pad_states": boost_pad_states,
         }
 
-        try:
-            self._sock.sendto(json.dumps(packet).encode("utf-8"), self._addr)
-        except OSError:
-            pass  # silently drop if socket fails
+        packet_bytes = json.dumps(packet).encode("utf-8")
+        with self._lock:
+            self._last_packet = packet_bytes
 
     def close(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+            self._thread = None
         if self._sock is not None:
             self._sock.close()
             self._sock = None
