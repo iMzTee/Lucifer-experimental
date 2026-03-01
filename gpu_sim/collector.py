@@ -68,7 +68,9 @@ class GPUCollector:
         self.layout = get_agent_layout(self.n_agents)
         self.total_agents = n_envs * self.n_agents
 
-        self.env = GPUEnvironment(n_envs, device, stage=stage, vis_sender=vis_sender)
+        self.env = GPUEnvironment(n_envs, device, stage=stage)
+        if vis_sender is not None and vis_sender.enabled:
+            self.env.tick_skip = 2  # finer steps for smooth visualization
         self.rewards = GPURewards(n_envs, device, n_agents=self.n_agents, layout=self.layout)
 
         # Obs normalization
@@ -125,7 +127,9 @@ class GPUCollector:
             self.layout = get_agent_layout(new_n_agents)
             self.total_agents = new_n_envs * new_n_agents
 
-            self.env = GPUEnvironment(new_n_envs, self.device, stage=stage, vis_sender=self.vis_sender)
+            self.env = GPUEnvironment(new_n_envs, self.device, stage=stage)
+            if self.vis_sender is not None and self.vis_sender.enabled:
+                self.env.tick_skip = 2
             self.rewards = GPURewards(new_n_envs, self.device,
                                        n_agents=new_n_agents, layout=self.layout)
 
