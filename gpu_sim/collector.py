@@ -70,7 +70,7 @@ class GPUCollector:
 
         self.env = GPUEnvironment(n_envs, device, stage=stage)
         if vis_sender is not None and vis_sender.enabled:
-            self.env.tick_skip = 2  # finer steps for smooth visualization
+            self.env.tick_skip = 1  # real-time physics for smooth visualization
         self.rewards = GPURewards(n_envs, device, n_agents=self.n_agents, layout=self.layout)
 
         # Obs normalization
@@ -129,7 +129,7 @@ class GPUCollector:
 
             self.env = GPUEnvironment(new_n_envs, self.device, stage=stage)
             if self.vis_sender is not None and self.vis_sender.enabled:
-                self.env.tick_skip = 2
+                self.env.tick_skip = 1
             self.rewards = GPURewards(new_n_envs, self.device,
                                        n_agents=new_n_agents, layout=self.layout)
 
