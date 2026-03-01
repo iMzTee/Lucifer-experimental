@@ -1,11 +1,11 @@
 """vis_sender.py — Lightweight UDP sender for RocketSimVis.
 
-Extracts a single env from TensorState, builds the JSON packet
-matching RocketSimVis protocol, and sends over UDP to localhost:9273.
+Extracts a single env from TensorState and sends game state over UDP
+to localhost:9273. Uses client-side extrapolation to show real-time
+movement: the background thread advances positions using velocity and
+gravity at game speed between sparse physics updates.
 
-Buffers snapshots during fast physics bursts and replays them in slow
-motion via a background thread. Cycles through random envs every few
-seconds to show different scenarios. Zero overhead when disabled.
+Cycles through random envs every few seconds. Zero overhead when disabled.
 """
 
 import socket
@@ -13,97 +13,35 @@ import json
 import random
 import threading
 import time
-from collections import deque
 
-
-def _lerp(a, b, t):
-    """Linearly interpolate between two lists of floats."""
-    return [a[i] + (b[i] - a[i]) * t for i in range(len(a))]
-
-
-def _lerp_packet(p1, p2, t):
-    """Interpolate positions between two packets, zero velocities."""
-    result = {
-        "ball_phys": {
-            "pos": _lerp(p1["ball_phys"]["pos"], p2["ball_phys"]["pos"], t),
-            "vel": [0, 0, 0],
-            "ang_vel": [0, 0, 0],
-        },
-        "cars": [],
-        "boost_pad_states": p2["boost_pad_states"],
-    }
-    for c1, c2 in zip(p1["cars"], p2["cars"]):
-        result["cars"].append({
-            "team_num": c2["team_num"],
-            "phys": {
-                "pos": _lerp(c1["phys"]["pos"], c2["phys"]["pos"], t),
-                "vel": [0, 0, 0],
-                "ang_vel": [0, 0, 0],
-                "forward": _lerp(c1["phys"]["forward"], c2["phys"]["forward"], t),
-                "up": _lerp(c1["phys"]["up"], c2["phys"]["up"], t),
-            },
-            "boost_amount": c1["boost_amount"] + (c2["boost_amount"] - c1["boost_amount"]) * t,
-            "on_ground": c2["on_ground"],
-            "is_demoed": c2["is_demoed"],
-            "has_flip": c2["has_flip"],
-        })
-    return result
-
-
-def _zero_vel_packet(p):
-    """Return packet with all velocities zeroed (prevents extrapolation)."""
-    result = {
-        "ball_phys": {
-            "pos": p["ball_phys"]["pos"],
-            "vel": [0, 0, 0],
-            "ang_vel": [0, 0, 0],
-        },
-        "cars": [],
-        "boost_pad_states": p["boost_pad_states"],
-    }
-    for c in p["cars"]:
-        result["cars"].append({
-            "team_num": c["team_num"],
-            "phys": {
-                "pos": c["phys"]["pos"],
-                "vel": [0, 0, 0],
-                "ang_vel": [0, 0, 0],
-                "forward": c["phys"]["forward"],
-                "up": c["phys"]["up"],
-            },
-            "boost_amount": c["boost_amount"],
-            "on_ground": c["on_ground"],
-            "is_demoed": c["is_demoed"],
-            "has_flip": c["has_flip"],
-        })
-    return result
+GRAVITY_Z = -650.0  # uu/s², matches constants.py
+FLOOR_Z = 17.0      # car resting height
+BALL_FLOOR_Z = 93.75 # ball resting height (BALL_RADIUS + 1)
 
 
 class VisSender:
     """Sends game state to RocketSimVis over UDP.
 
-    Buffers physics snapshots and replays with interpolation. Cycles
-    to a random env every `switch_interval` seconds so you can watch
-    different scenarios.
+    Between sparse physics snapshots, the background thread extrapolates
+    positions using velocity + gravity at game speed (30fps), giving
+    smooth real-time movement. When a new physics snapshot arrives, it
+    corrects the prediction.
 
     Args:
         n_envs: Total number of environments (for cycling).
         enabled: If False, all methods are no-ops (zero overhead).
         switch_interval: Seconds between switching to a new env.
-        transition_secs: Seconds to interpolate between each pair of frames.
         port: UDP port for RocketSimVis (default 9273).
     """
 
-    def __init__(self, n_envs=1, enabled=False, switch_interval=5.0,
-                 transition_secs=2.0, port=9273):
+    def __init__(self, n_envs=1, enabled=False, switch_interval=5.0, port=9273):
         self.n_envs = n_envs
         self.enabled = enabled
         self.port = port
         self.switch_interval = switch_interval
-        self.transition_secs = transition_secs
         self.env_idx = 0
         self._sock = None
-        self._queue = deque()
+        self._state = None  # mutable state for extrapolation
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -118,18 +56,74 @@ class VisSender:
             print(f"[VIS] Watching env {self.env_idx}, switching every {switch_interval}s")
 
     def _switch_env(self):
-        """Switch to a new random env, clear the queue."""
+        """Switch to a new random env, clear state."""
         self.env_idx = random.randint(0, max(0, self.n_envs - 1))
         self._last_switch = time.time()
-        self._queue.clear()
+        self._state = None
         print(f"[VIS] Switched to env {self.env_idx}")
 
-    def _send_loop(self):
-        """Background: interpolate between queued frames at 30fps."""
-        prev = None
-        target = None
-        interp_start = 0
+    def _extrapolate(self, dt):
+        """Advance positions by dt seconds using velocity + gravity."""
+        s = self._state
+        if s is None:
+            return
 
+        # Ball
+        bp = s["ball_phys"]
+        bp["pos"][0] += bp["vel"][0] * dt
+        bp["pos"][1] += bp["vel"][1] * dt
+        bp["pos"][2] += bp["vel"][2] * dt
+        bp["vel"][2] += GRAVITY_Z * dt
+        # Floor clamp
+        if bp["pos"][2] < BALL_FLOOR_Z:
+            bp["pos"][2] = BALL_FLOOR_Z
+            bp["vel"][2] = max(0, bp["vel"][2])
+
+        # Cars
+        for c in s["cars"]:
+            p = c["phys"]
+            p["pos"][0] += p["vel"][0] * dt
+            p["pos"][1] += p["vel"][1] * dt
+            p["pos"][2] += p["vel"][2] * dt
+            if not c["on_ground"]:
+                p["vel"][2] += GRAVITY_Z * dt
+            # Floor clamp
+            if p["pos"][2] < FLOOR_Z:
+                p["pos"][2] = FLOOR_Z
+                p["vel"][2] = max(0, p["vel"][2])
+
+    def _build_packet(self):
+        """Build a zero-velocity packet from current extrapolated state."""
+        s = self._state
+        packet = {
+            "ball_phys": {
+                "pos": list(s["ball_phys"]["pos"]),
+                "vel": [0, 0, 0],
+                "ang_vel": [0, 0, 0],
+            },
+            "cars": [],
+            "boost_pad_states": s["boost_pad_states"],
+        }
+        for c in s["cars"]:
+            packet["cars"].append({
+                "team_num": c["team_num"],
+                "phys": {
+                    "pos": list(c["phys"]["pos"]),
+                    "vel": [0, 0, 0],
+                    "ang_vel": [0, 0, 0],
+                    "forward": c["phys"]["forward"],
+                    "up": c["phys"]["up"],
+                },
+                "boost_amount": c["boost_amount"],
+                "on_ground": c["on_ground"],
+                "is_demoed": c["is_demoed"],
+                "has_flip": c["has_flip"],
+            })
+        return packet
+
+    def _send_loop(self):
+        """Background: extrapolate at game speed, send at 30fps."""
+        dt = 1.0 / 30
         while not self._stop.is_set():
             now = time.time()
 
@@ -137,45 +131,25 @@ class VisSender:
             if now - self._last_switch >= self.switch_interval:
                 with self._lock:
                     self._switch_env()
-                prev = None
-                target = None
 
-            # Grab new frames from queue
             with self._lock:
-                while self._queue:
-                    frame = self._queue.popleft()
-                    if prev is None:
-                        prev = frame
-                    else:
-                        if target is not None:
-                            prev = target
-                        target = frame
-                        interp_start = now
+                if self._state is not None:
+                    self._extrapolate(dt)
+                    packet = self._build_packet()
+                else:
+                    packet = None
 
-            # Decide what to send
-            if prev is not None and target is not None:
-                elapsed = now - interp_start
-                t = min(elapsed / self.transition_secs, 1.0)
-                packet = _lerp_packet(prev, target, t)
+            if packet is not None:
+                try:
+                    self._sock.sendto(
+                        json.dumps(packet).encode("utf-8"), self._addr)
+                except OSError:
+                    pass
 
-                if t >= 1.0:
-                    prev = target
-                    target = None
-            elif prev is not None:
-                packet = _zero_vel_packet(prev)
-            else:
-                self._stop.wait(1.0 / 30)
-                continue
-
-            try:
-                self._sock.sendto(json.dumps(packet).encode("utf-8"), self._addr)
-            except OSError:
-                pass
-
-            self._stop.wait(1.0 / 30)
+            self._stop.wait(dt)
 
     def send(self, state):
-        """Snapshot the current env's state into the replay queue.
+        """Snapshot the current env's state, correcting extrapolation.
 
         Args:
             state: TensorState from GPUEnvironment.
@@ -212,14 +186,14 @@ class VisSender:
 
         boost_pad_states = (state.boost_pad_timers[i] == 0).cpu().tolist()
 
-        packet = {
+        snapshot = {
             "ball_phys": ball_phys,
             "cars": cars,
             "boost_pad_states": boost_pad_states,
         }
 
         with self._lock:
-            self._queue.append(packet)
+            self._state = snapshot
 
     def close(self):
         self._stop.set()
