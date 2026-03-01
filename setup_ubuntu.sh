@@ -36,7 +36,7 @@ source venv/bin/activate
 
 pip install --upgrade pip
 pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
-pip install rlgym-sim rlgym-ppo numpy psutil tensorboard
+pip install -r requirements.txt
 
 # 5. Verify
 echo ""
