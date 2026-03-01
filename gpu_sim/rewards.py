@@ -3,7 +3,7 @@
 Supports variable n_agents (1v0, 1v1, 2v2).
 Operates on TensorState directly (no data movement).
 
-Reward channels (9 continuous, 5 event):
+Reward channels (11 continuous, 5 event):
   P1: BallToGoalPotential (potential-based)
   P2: VelTowardGoalPotential (potential-based)
   R3: TouchQuality (event-like, with consecutive air touch multiplier)
@@ -13,6 +13,8 @@ Reward channels (9 continuous, 5 event):
   R7: BoostPickup (event-like)
   R8: DefensivePos (conditional, support players)
   R9: AggressionBias (flat constant, stages 3+)
+  R10: AirReward (binary airborne signal)
+  R11: BoostConservation (sqrt boost amount)
 
 Research basis: Necto (potential shaping, team_spirit), Lucy-SKG,
 ZealanL PPO Guide (staged curriculum), Kaiyo-bot (consecutive air touches).
@@ -26,14 +28,14 @@ from .constants import (
 
 # ── Reward weights per stage ──
 # [P1:BallGoalPot, P2:VelGoalPot, R3:TouchQual, R4:FaceBall, R5:SpeedToBall,
-#  R6:Kickoff, R7:BoostPickup, R8:DefPos, R9:AggrBias]
+#  R6:Kickoff, R7:BoostPickup, R8:DefPos, R9:AggrBias, R10:Air, R11:BoostSave]
 STAGE_WEIGHTS = {
-    0: [0.0, 0.0, 2.0, 3.0, 2.0, 3.0, 0.5, 0.0, 0.0],  # Face, approach, touch. NO goal signal.
-    1: [2.0, 1.5, 2.5, 1.5, 1.5, 2.0, 0.5, 0.0, 0.0],  # Introduce ball-to-goal potentials
-    2: [3.0, 2.0, 3.0, 1.0, 1.0, 2.0, 0.5, 0.0, 0.0],  # Touch quality up (aerial touches)
-    3: [4.0, 3.0, 3.0, 0.5, 0.5, 2.0, 1.0, 0.5, 0.2],  # 1v1: aggression, defense, boost
-    4: [5.0, 3.5, 3.0, 0.3, 0.3, 1.5, 1.0, 1.0, 0.2],  # 1v1 advanced: more offense
-    5: [5.0, 3.5, 3.0, 0.2, 0.2, 1.5, 1.0, 1.5, 0.2],  # 2v2: defensive pos, team play
+    0: [0.0, 0.0, 2.0, 3.0, 2.0, 3.0, 0.5, 0.0, 0.0, 0.15, 0.0],
+    1: [2.0, 1.5, 2.5, 1.5, 1.5, 2.0, 0.5, 0.0, 0.0, 0.15, 0.0],
+    2: [3.0, 2.0, 3.0, 1.0, 1.0, 2.0, 0.5, 0.0, 0.0, 0.2,  0.1],
+    3: [4.0, 3.0, 3.0, 0.5, 0.5, 2.0, 1.0, 0.5, 0.2, 0.1,  0.2],
+    4: [5.0, 3.5, 3.0, 0.3, 0.3, 1.5, 1.0, 1.0, 0.2, 0.05, 0.2],
+    5: [5.0, 3.5, 3.0, 0.2, 0.2, 1.5, 1.0, 1.5, 0.2, 0.05, 0.2],
 }
 
 # [GoalScored, TeamScore, OppScore, Demo, Touched]
@@ -223,8 +225,9 @@ class GPURewards:
             ball_z = s.ball_pos[:, 2].unsqueeze(1)
             ball_speed_e = ball_speed.unsqueeze(1)
 
-            # Height: sqrt scaling (Necto approach)
+            # Height: sqrt scaling (Necto approach), only for aerial touches
             height_mult = 1.0 + torch.sqrt(ball_z.clamp(min=0) / 2044.0)
+            height_mult = torch.where(s.car_on_ground < 0.5, height_mult, torch.ones_like(height_mult))
 
             # Speed: normalize by BALL_MAX_SPEED
             speed_factor = 0.5 + 0.5 * (ball_speed_e / BALL_MAX_SPEED).clamp(max=2.0)
@@ -299,6 +302,14 @@ class GPURewards:
         # ── R9: AggressionBias (flat constant, stages 3+) ──
         if weights[8] > 0:
             rewards += weights[8]
+
+        # ── R10: AirReward (binary airborne signal) ──
+        if weights[9] > 0:
+            rewards += weights[9] * (s.car_on_ground < 0.5).float()
+
+        # ── R11: BoostConservation (sqrt boost amount) ──
+        if weights[10] > 0:
+            rewards += weights[10] * torch.sqrt(s.car_boost)
 
         # ── Event Reward ──
         current_ev = torch.zeros(E, A, 5, device=self.device)

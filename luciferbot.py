@@ -209,7 +209,7 @@ class GPULearner:
             obs_space_size=127,
             act_space_size=8,
             device=self.device,
-            batch_size=50000,
+            batch_size=ts_per_iteration,
             mini_batch_size=50000,
             n_epochs=2,
             policy_layer_sizes=(1024, 1024, 1024, 512),
@@ -411,7 +411,7 @@ class GPULearner:
         # 6. GPU experience buffer (no CPU transfer)
         t_buf = time.time()
         buffer = ExperienceBuffer(
-            max_size=self.ts_per_iteration + 20000, device="cuda", seed=123)
+            max_size=self.ts_per_iteration, device="cuda", seed=123)
         buffer.submit_experience(
             states, actions, log_probs, rewards_norm, next_states, dones, truncated, vt, adv)
         del states, actions, log_probs, rewards, rewards_norm, next_states, dones, truncated, vt, adv, exp
