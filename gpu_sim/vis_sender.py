@@ -21,12 +21,16 @@ def _lerp(a, b, t):
 
 
 def _lerp_packet(p1, p2, t):
-    """Interpolate all physics fields between two packets."""
+    """Interpolate positions between two packets, zero velocities.
+
+    We handle interpolation ourselves so velocities must be zero to
+    prevent RocketSimVis from extrapolating on top.
+    """
     result = {
         "ball_phys": {
             "pos": _lerp(p1["ball_phys"]["pos"], p2["ball_phys"]["pos"], t),
-            "vel": _lerp(p1["ball_phys"]["vel"], p2["ball_phys"]["vel"], t),
-            "ang_vel": _lerp(p1["ball_phys"]["ang_vel"], p2["ball_phys"]["ang_vel"], t),
+            "vel": [0, 0, 0],
+            "ang_vel": [0, 0, 0],
         },
         "cars": [],
         "boost_pad_states": p2["boost_pad_states"],
@@ -36,8 +40,8 @@ def _lerp_packet(p1, p2, t):
             "team_num": c2["team_num"],
             "phys": {
                 "pos": _lerp(c1["phys"]["pos"], c2["phys"]["pos"], t),
-                "vel": _lerp(c1["phys"]["vel"], c2["phys"]["vel"], t),
-                "ang_vel": _lerp(c1["phys"]["ang_vel"], c2["phys"]["ang_vel"], t),
+                "vel": [0, 0, 0],
+                "ang_vel": [0, 0, 0],
                 "forward": _lerp(c1["phys"]["forward"], c2["phys"]["forward"], t),
                 "up": _lerp(c1["phys"]["up"], c2["phys"]["up"], t),
             },
