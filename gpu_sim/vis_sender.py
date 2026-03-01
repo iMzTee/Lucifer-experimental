@@ -44,7 +44,6 @@ class VisSender:
         self._stop = threading.Event()
         self._thread = None
         self._last_switch = time.time()
-        self._ground_search_ttl = 0
 
         if enabled:
             self.env_idx = random.randint(0, max(0, n_envs - 1))
@@ -55,10 +54,9 @@ class VisSender:
             print(f"[VIS] Watching env {self.env_idx}, switching every {switch_interval}s")
 
     def _switch_env(self):
-        """Switch to a new random env (keeps last packet alive during search)."""
+        """Switch to a new random env."""
         self.env_idx = random.randint(0, max(0, self.n_envs - 1))
         self._last_switch = time.time()
-        self._ground_search_ttl = 30  # try up to 30 send() calls to find grounded car
         print(f"[VIS] Switched to env {self.env_idx}")
 
     @staticmethod
@@ -128,14 +126,6 @@ class VisSender:
 
         i = self.env_idx
         n_agents = state.n_agents
-
-        # After switching, prefer envs where car 0 is on the ground
-        if self._ground_search_ttl > 0:
-            self._ground_search_ttl -= 1
-            if not (state.car_on_ground[i, 0].item() > 0.5):
-                # Try another env next call — keep sending old packet meanwhile
-                self.env_idx = random.randint(0, max(0, self.n_envs - 1))
-                return
 
         ball_phys = {
             "pos": state.ball_pos[i].cpu().tolist(),
