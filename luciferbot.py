@@ -192,9 +192,9 @@ class GPULearner:
 
         # Visualization sender (zero overhead when disabled)
         vis_enabled = os.environ.get("VIS", "0") == "1"
-        vis_sender = VisSender(env_idx=0, enabled=vis_enabled) if vis_enabled else None
+        vis_sender = VisSender(n_envs=n_envs, enabled=vis_enabled) if vis_enabled else None
         if vis_enabled:
-            print("[*] Visualization enabled — sending env 0 to RocketSimVis (UDP 127.0.0.1:9273)")
+            print("[*] Visualization enabled — cycling envs every 5s (UDP 127.0.0.1:9273)")
             print("[*] Start viewer: cd rocketsimvis && python main.py")
 
         # GPU Collector
@@ -495,7 +495,7 @@ if __name__ == "__main__":
     #   Stage 3 (1v1): 80k envs x 2 agents  — 1v1 Basics
     #   Stage 4 (1v1): 80k envs x 2 agents  — 1v1 Advanced
     #   Stage 5 (2v2): 40k envs x 4 agents  — 2v2 Teamwork
-    TS_PER_ITERATION = 200000
+    TS_PER_ITERATION = 1000000
 
     print(f"\n[*] LuciferBot")
     print(f"[*] Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")

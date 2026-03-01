@@ -4,12 +4,13 @@ Extracts a single env from TensorState, builds the JSON packet
 matching RocketSimVis protocol, and sends over UDP to localhost:9273.
 
 Buffers snapshots during fast physics bursts and replays them in slow
-motion via a background thread, smoothly filling the gaps between
-collection phases. Zero overhead when disabled.
+motion via a background thread. Cycles through random envs every few
+seconds to show different scenarios. Zero overhead when disabled.
 """
 
 import socket
 import json
+import random
 import threading
 import time
 from collections import deque
@@ -21,11 +22,7 @@ def _lerp(a, b, t):
 
 
 def _lerp_packet(p1, p2, t):
-    """Interpolate positions between two packets, zero velocities.
-
-    We handle interpolation ourselves so velocities must be zero to
-    prevent RocketSimVis from extrapolating on top.
-    """
+    """Interpolate positions between two packets, zero velocities."""
     result = {
         "ball_phys": {
             "pos": _lerp(p1["ball_phys"]["pos"], p2["ball_phys"]["pos"], t),
@@ -85,42 +82,63 @@ def _zero_vel_packet(p):
 class VisSender:
     """Sends game state to RocketSimVis over UDP.
 
-    Buffers physics snapshots during collection and replays them via a
-    background thread with interpolation, creating smooth slow-motion
-    playback that fills the gaps between physics bursts.
+    Buffers physics snapshots and replays with interpolation. Cycles
+    to a random env every `switch_interval` seconds so you can watch
+    different scenarios.
 
     Args:
-        env_idx: Which environment index to visualize (default 0).
+        n_envs: Total number of environments (for cycling).
         enabled: If False, all methods are no-ops (zero overhead).
+        switch_interval: Seconds between switching to a new env.
         transition_secs: Seconds to interpolate between each pair of frames.
         port: UDP port for RocketSimVis (default 9273).
     """
 
-    def __init__(self, env_idx=0, enabled=False, transition_secs=2.0, port=9273):
-        self.env_idx = env_idx
+    def __init__(self, n_envs=1, enabled=False, switch_interval=5.0,
+                 transition_secs=2.0, port=9273):
+        self.n_envs = n_envs
         self.enabled = enabled
         self.port = port
+        self.switch_interval = switch_interval
         self.transition_secs = transition_secs
+        self.env_idx = 0
         self._sock = None
         self._queue = deque()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self._last_switch = time.time()
 
         if enabled:
+            self.env_idx = random.randint(0, max(0, n_envs - 1))
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._addr = ("127.0.0.1", port)
             self._thread = threading.Thread(target=self._send_loop, daemon=True)
             self._thread.start()
+            print(f"[VIS] Watching env {self.env_idx}, switching every {switch_interval}s")
+
+    def _switch_env(self):
+        """Switch to a new random env, clear the queue."""
+        self.env_idx = random.randint(0, max(0, self.n_envs - 1))
+        self._last_switch = time.time()
+        self._queue.clear()
+        print(f"[VIS] Switched to env {self.env_idx}")
 
     def _send_loop(self):
         """Background: interpolate between queued frames at 30fps."""
-        prev = None      # last completed frame
-        target = None     # interpolating toward this
-        interp_start = 0  # when interpolation began
+        prev = None
+        target = None
+        interp_start = 0
 
         while not self._stop.is_set():
             now = time.time()
+
+            # Check if it's time to switch env
+            if now - self._last_switch >= self.switch_interval:
+                with self._lock:
+                    self._switch_env()
+                prev = None
+                target = None
 
             # Grab new frames from queue
             with self._lock:
@@ -129,7 +147,6 @@ class VisSender:
                     if prev is None:
                         prev = frame
                     else:
-                        # If we already had a target, skip to it
                         if target is not None:
                             prev = target
                         target = frame
@@ -141,12 +158,10 @@ class VisSender:
                 t = min(elapsed / self.transition_secs, 1.0)
                 packet = _lerp_packet(prev, target, t)
 
-                # Transition done — advance
                 if t >= 1.0:
                     prev = target
                     target = None
             elif prev is not None:
-                # Holding at last known position, zero velocity
                 packet = _zero_vel_packet(prev)
             else:
                 self._stop.wait(1.0 / 30)
@@ -160,7 +175,7 @@ class VisSender:
             self._stop.wait(1.0 / 30)
 
     def send(self, state):
-        """Snapshot a single env's state into the replay queue.
+        """Snapshot the current env's state into the replay queue.
 
         Args:
             state: TensorState from GPUEnvironment.
