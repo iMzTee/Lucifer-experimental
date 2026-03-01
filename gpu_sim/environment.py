@@ -89,10 +89,10 @@ class GPUEnvironment:
         s.ball_vel[mask] = 0.0
         s.ball_ang_vel[mask] = 0.0
 
-        # ── Scenario selection by stage ──
-        if self.stage == 0:
+        # ── Scenario selection by agent count ──
+        if A == 1:
             self._reset_stage0_scenarios(mask, n_reset)
-        elif self.stage <= 2:
+        elif A == 2:
             self._reset_stage1_2_scenarios(mask, n_reset)
         else:
             self._reset_stage3_scenarios(mask, n_reset)
