@@ -169,8 +169,8 @@ def _amp_learn(self, exp):
 
 # ─── CurriculumTracker (identical to lucifer2.py) ───
 class CurriculumTracker:
-    ENTROPY_ADVANCE     = [1.5, 1.3, 1.0]
-    ENTROPY_CONSECUTIVE = 10
+    ENTROPY_ADVANCE     = [0.5, 0.5, 0.5]
+    ENTROPY_CONSECUTIVE = 3
     MIN_STAGE_ITERS     = [500, 2000, 2500]
     CLIP_HIGH_THRESH    = 0.25
     CLIP_HIGH_ITERS     = 5
