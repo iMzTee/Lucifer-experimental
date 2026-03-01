@@ -495,7 +495,7 @@ if __name__ == "__main__":
     #   Stage 3 (1v1): 80k envs x 2 agents  — 1v1 Basics
     #   Stage 4 (1v1): 80k envs x 2 agents  — 1v1 Advanced
     #   Stage 5 (2v2): 40k envs x 4 agents  — 2v2 Teamwork
-    TS_PER_ITERATION = 1000000
+    TS_PER_ITERATION = 320000
 
     print(f"\n[*] LuciferBot")
     print(f"[*] Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
