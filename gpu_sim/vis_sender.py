@@ -157,7 +157,7 @@ class VisSender:
                 else:
                     self._send_udp(self._extrapolate(packet, age))
 
-            self._stop.wait(1.0 / 30)
+            self._stop.wait(1.0 / 60)
 
     def send(self, state):
         """Snapshot the current env's state and send immediately.
