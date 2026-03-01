@@ -1,55 +1,80 @@
 """constants.py — Arena dimensions, physics constants, boost pad positions.
 
-All values from RocketSim / rlgym_sim. Stored as Python floats; converted to
-tensors at init time in the modules that need them.
+All values from RocketSim (github.com/ZealanL/RocketSim). Stored as Python
+floats; converted to tensors at init time in the modules that need them.
 """
 
 import torch
+import math
 
 # ── Arena geometry ──
 ARENA_HALF_X = 4096.0       # side walls
 ARENA_HALF_Y = 5120.0       # back walls (goal wall Y)
-ARENA_HEIGHT = 2044.0        # ceiling
+ARENA_HEIGHT = 2048.0        # ceiling
 GOAL_HALF_WIDTH = 892.755    # goal opening half-width in X
 GOAL_HEIGHT = 642.775        # goal opening height
 GOAL_DEPTH = 880.0           # back net depth behind goal line
 CORNER_RADIUS = 1024.0       # curved corner radius (simplified to flat)
 
 # ── Ball ──
-BALL_RADIUS = 92.75
+BALL_RADIUS = 91.25          # soccar ball collision radius
+BALL_REST_Z = 93.15          # resting height on flat ground
 BALL_MAX_SPEED = 6000.0
 BALL_RESTITUTION = 0.6       # bounce coefficient
-BALL_DRAG = 0.0305           # per-second drag factor (approx from RocketSim)
-BALL_MASS = 30.0             # relative mass for collision
+BALL_DRAG = 0.03             # per-second drag factor
+BALL_MASS = 30.0             # relative mass for collision (180/6)
 
 # ── Car (Octane) ──
-CAR_HITBOX_HALF = (118.01, 84.20, 36.16)   # half-extents (L, W, H)
-CAR_HITBOX_OFFSET = (13.88, 0.0, 20.75)    # hitbox center offset from car origin
+CAR_HITBOX_LENGTH = 120.507  # full hitbox dimensions
+CAR_HITBOX_WIDTH = 86.6994
+CAR_HITBOX_HEIGHT = 38.6591
+CAR_HITBOX_OFFSET = (13.8757, 0.0, 20.755)
 CAR_EFFECTIVE_RADIUS = 75.0   # sphere approximation for collision
 CAR_MAX_SPEED = 2300.0
 CAR_SUPERSONIC_SPEED = 2200.0  # demo threshold
 CAR_MASS = 180.0              # relative mass for collision
+CAR_WHEELBASE = 85.0          # front_wheel_x - rear_wheel_x
 
-# Ground car physics
-THROTTLE_ACCEL = 1600.0       # uu/s² max throttle acceleration
+# ── Ground car physics ──
+# Throttle: base acceleration scaled by speed-dependent torque factor
+THROTTLE_ACCEL = 1600.0       # uu/s² peak throttle acceleration (at 0 speed)
 BRAKE_ACCEL = 3500.0          # uu/s² braking deceleration
-BOOST_ACCEL = 991.667         # uu/s² boost acceleration
+COAST_DECEL = 525.0           # uu/s² coasting deceleration (no throttle)
+STOPPING_SPEED = 25.0         # uu/s below which car fully stops
+
+# Throttle torque factor curve: piecewise linear (speed → factor)
+# At 0 speed: full torque; at 1410 uu/s: zero torque (max throttle-only speed)
+THROTTLE_TORQUE_SPEEDS = [0.0, 1400.0, 1410.0]
+THROTTLE_TORQUE_FACTORS = [1.0, 0.1, 0.0]
+
+# Boost
+BOOST_ACCEL_GROUND = 991.667  # uu/s² boost on ground (2975/3)
+BOOST_ACCEL_AIR = 1058.333    # uu/s² boost in air (3175/3)
 BOOST_CONSUMPTION = 33.3      # boost per second (100 boost lasts 3s)
-MAX_STEER_RATE = 2.5          # rad/s max ground turn rate
 
-# Air car physics
-PITCH_TORQUE = 12.46          # rad/s² pitch
-YAW_TORQUE = 9.11             # rad/s² yaw
-ROLL_TORQUE = 38.34           # rad/s² roll
+# Steering: speed-dependent steer angle curve (piecewise linear)
+# abs(speed) → steer_angle (radians) at full steer input
+STEER_ANGLE_SPEEDS = [0.0, 500.0, 1000.0, 1500.0, 1750.0, 3000.0]
+STEER_ANGLE_VALUES = [0.53356, 0.31930, 0.18203, 0.10570, 0.08507, 0.03454]
+
+# ── Air car physics ──
+PITCH_TORQUE = 12.46          # rad/s² pitch (130 * CAR_TORQUE_SCALE)
+YAW_TORQUE = 9.11             # rad/s² yaw (95 * CAR_TORQUE_SCALE)
+ROLL_TORQUE = 38.34           # rad/s² roll (400 * CAR_TORQUE_SCALE)
 ANG_VEL_DAMPING = 0.988       # per-tick angular velocity damping (120Hz)
-AIR_THROTTLE_ACCEL = 66.667   # uu/s² air throttle (very weak)
+AIR_THROTTLE_ACCEL = 66.667   # uu/s² air throttle (200/3)
+CAR_MAX_ANG_SPEED = 5.5       # rad/s max angular velocity magnitude
 
-# Jump / flip
-JUMP_IMPULSE = 292.0          # uu/s upward impulse on first jump
-JUMP_HOLD_FORCE = 1458.0      # uu/s² sustained upward force while holding
+# ── Jump / flip ──
+JUMP_IMPULSE = 291.667        # uu/s upward impulse on first jump (875/3)
+JUMP_HOLD_FORCE = 1458.333    # uu/s² sustained upward force while holding (4375/3)
 JUMP_HOLD_TIME = 0.2          # seconds max hold duration
-FLIP_IMPULSE = 500.0          # uu/s horizontal dodge impulse
-FLIP_TORQUE = 5.5             # rad/s² dodge spin
+FLIP_IMPULSE = 500.0          # uu/s base horizontal dodge velocity
+FLIP_FORWARD_SCALE = 1.0      # dodge impulse scale: forward
+FLIP_SIDE_SCALE = 1.9         # dodge impulse scale: sideways
+FLIP_BACKWARD_SCALE = 2.5     # dodge impulse scale: backward
+FLIP_BACKWARD_X_SCALE = 16.0 / 15.0  # extra backward multiplier (1.067)
+FLIP_Z_DAMP = 0.05            # Z velocity multiplier on dodge (~0.65^7)
 FLIP_TIMER = 1.25             # seconds after jump before flip expires
 DEMO_RESPAWN_TIME = 3.0       # seconds until respawn after demo
 
@@ -184,11 +209,18 @@ STAGE_CONFIG = {
 PHYSICS_HZ = 120
 DT = 1.0 / PHYSICS_HZ
 
-# ── Kickoff positions ──
+# ── Kickoff positions (blue side) ──
 KICKOFF_POSITIONS = torch.tensor([
-    [-2048.0, -2560.0, 17.0],
-    [ 2048.0, -2560.0, 17.0],
-    [ -256.0, -3840.0, 17.0],
-    [  256.0, -3840.0, 17.0],
-    [    0.0, -4608.0, 17.0],
+    [-2048.0, -2560.0, 17.0],   # right diagonal
+    [ 2048.0, -2560.0, 17.0],   # left diagonal
+    [ -256.0, -3840.0, 17.0],   # right back-center
+    [  256.0, -3840.0, 17.0],   # left back-center
+    [    0.0, -4608.0, 17.0],   # far back (goalie)
+], dtype=torch.float32)
+KICKOFF_YAWS = torch.tensor([
+    math.pi / 4,      # right diagonal: 45° (facing toward center)
+    3 * math.pi / 4,  # left diagonal: 135° (facing toward center)
+    math.pi / 2,      # right back-center: 90° (facing forward)
+    math.pi / 2,      # left back-center: 90° (facing forward)
+    math.pi / 2,      # far back: 90° (facing forward)
 ], dtype=torch.float32)

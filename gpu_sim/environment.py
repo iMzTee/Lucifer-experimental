@@ -14,7 +14,7 @@ from .constants import (
     BOOST_PAD_POSITIONS, N_BOOST_PADS, N_LARGE_PADS,
     LARGE_PAD_BOOST, SMALL_PAD_BOOST, LARGE_PAD_RESPAWN, SMALL_PAD_RESPAWN,
     BOOST_PAD_PICKUP_RADIUS, CAR_MAX_SPEED, DT, PHYSICS_HZ,
-    KICKOFF_POSITIONS, STAGE_CONFIG, get_agent_layout,
+    KICKOFF_POSITIONS, KICKOFF_YAWS, STAGE_CONFIG, get_agent_layout,
 )
 from .physics import (
     apply_car_controls, integrate_positions, update_rotation_vectors,
@@ -59,8 +59,9 @@ class GPUEnvironment:
         self._pad_amount[:N_LARGE_PADS] = LARGE_PAD_BOOST
         self._pad_amount[N_LARGE_PADS:] = SMALL_PAD_BOOST
 
-        # Kickoff positions on device
+        # Kickoff positions and yaws on device
         self._kickoff_pos = KICKOFF_POSITIONS.to(device)
+        self._kickoff_yaws = KICKOFF_YAWS.to(device)
 
         # Goal tracking
         self._prev_blue_score = torch.zeros(n_envs, dtype=torch.long, device=device)
@@ -170,12 +171,11 @@ class GPUEnvironment:
             scenarios[scenario_idx](full_mask, n_s)
 
     def _reset_kickoff_1v0(self, mask, n):
-        """Solo kickoff: random kickoff position, ball at center."""
+        """Solo kickoff: random kickoff position with correct yaw per position."""
         s = self.state
         pos_idx = torch.randint(0, 5, (n,), device=self.device)
-        positions = self._kickoff_pos[pos_idx]
-        s.car_pos[mask, 0] = positions
-        yaw = torch.full((n,), math.pi / 2, device=self.device)
+        s.car_pos[mask, 0] = self._kickoff_pos[pos_idx]
+        yaw = self._kickoff_yaws[pos_idx]
         s.car_quat[mask, 0] = quat_from_euler(
             torch.zeros(n, device=self.device), yaw, torch.zeros(n, device=self.device))
         s.car_boost[mask, 0] = 0.33
@@ -406,21 +406,21 @@ class GPUEnvironment:
             scenario_fn(full_mask, n_s)
 
     def _reset_kickoff_1v1(self, mask, n):
-        """1v1 kickoff: both at kickoff positions."""
+        """1v1 kickoff: both at kickoff positions with correct yaws."""
         s = self.state
         # Blue
         pos_idx = torch.randint(0, 5, (n,), device=self.device)
         s.car_pos[mask, 0] = self._kickoff_pos[pos_idx]
-        yaw = torch.full((n,), math.pi / 2, device=self.device)
+        yaw = self._kickoff_yaws[pos_idx]
         s.car_quat[mask, 0] = quat_from_euler(
             torch.zeros(n, device=self.device), yaw, torch.zeros(n, device=self.device))
         s.car_boost[mask, 0] = 0.33
 
-        # Orange (mirrored)
+        # Orange (mirrored: negate X/Y, rotate yaw by pi)
         pos_idx = torch.randint(0, 5, (n,), device=self.device)
         positions = self._kickoff_pos[pos_idx] * torch.tensor([-1.0, -1.0, 1.0], device=self.device)
         s.car_pos[mask, 1] = positions
-        yaw = torch.full((n,), -math.pi / 2, device=self.device)
+        yaw = self._kickoff_yaws[pos_idx] + math.pi
         s.car_quat[mask, 1] = quat_from_euler(
             torch.zeros(n, device=self.device), yaw, torch.zeros(n, device=self.device))
         s.car_boost[mask, 1] = 0.33
@@ -718,9 +718,9 @@ class GPUEnvironment:
             fn(full_mask, full_mask.sum().item())
 
     def _reset_kickoff_2v2(self, mask, n):
-        """Standard 2v2 kickoff."""
+        """Standard 2v2 kickoff with correct per-position yaws."""
         s = self.state
-        for team_offset, yaw, y_sign in [(0, math.pi / 2, 1.0), (2, -math.pi / 2, -1.0)]:
+        for team_offset, yaw_offset, y_sign in [(0, 0.0, 1.0), (2, math.pi, -1.0)]:
             for car_local in range(2):
                 car_idx = team_offset + car_local
                 pos_idx = torch.randint(0, 5, (n,), device=self.device)
@@ -728,7 +728,7 @@ class GPUEnvironment:
                 if y_sign < 0:
                     positions = positions * torch.tensor([-1.0, -1.0, 1.0], device=self.device)
                 s.car_pos[mask, car_idx] = positions
-                yaw_t = torch.full((n,), yaw, device=self.device)
+                yaw_t = self._kickoff_yaws[pos_idx] + yaw_offset
                 s.car_quat[mask, car_idx] = quat_from_euler(
                     torch.zeros(n, device=self.device), yaw_t, torch.zeros(n, device=self.device))
 
