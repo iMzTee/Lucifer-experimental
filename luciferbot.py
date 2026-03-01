@@ -23,14 +23,15 @@ from gpu_sim.ppo import PPOLearner, ExperienceBuffer
 
 # ─── Curriculum state persistence ───
 CURRICULUM_STATE_FILE = "curriculum_state.json"
-CURRICULUM_STAGE_NAMES = ["Solo Mechanics", "1v1 Mechanics", "1v1 Game Sense", "2v2 Teamwork"]
+CURRICULUM_STAGE_NAMES = ["Ground Basics", "Ground Advanced", "Air Mechanics", "1v1 Basics", "1v1 Advanced", "2v2 Teamwork"]
 
 DEFAULT_CURRICULUM_STATE = {
     "stage": 0,
-    "policy_lr": 2e-4,
-    "critic_lr": 2e-4,
+    "policy_lr": 3e-4,
+    "critic_lr": 3e-4,
     "ent_coef": 0.01,
     "clip_high_count": 0,
+    "val_loss_high_count": 0,
     "stage_iter_count": 0,
     "entropy_low_count": 0,
 }
@@ -65,28 +66,32 @@ def log_memory_usage(label):
 # ─── CurriculumTracker ───
 class CurriculumTracker:
     # Adjusted for 5-bin action space (max entropy ~10.1 vs old ~7.6)
-    ENTROPY_ADVANCE     = [0.7, 0.7, 0.7]
+    ENTROPY_ADVANCE     = [0.7, 0.7, 0.7, 0.7, 0.7]
     ENTROPY_CONSECUTIVE = 3
-    MIN_STAGE_ITERS     = [500, 2000, 2500]
+    MIN_STAGE_ITERS     = [500, 500, 1000, 2000, 2500]
     CLIP_HIGH_THRESH    = 0.25
     CLIP_HIGH_ITERS     = 5
+    VAL_LOSS_HIGH_THRESH = 10.0
+    VAL_LOSS_HIGH_ITERS  = 5
 
     def __init__(self, state):
-        self.stage             = state["stage"]
-        self.policy_lr         = state["policy_lr"]
-        self.critic_lr         = state["critic_lr"]
-        self.ent_coef          = state["ent_coef"]
-        self.clip_high_count   = state.get("clip_high_count", 0)
-        self.stage_iter_count  = state.get("stage_iter_count", 0)
-        self.entropy_low_count = state.get("entropy_low_count", 0)
-        self.restart_requested = False
-        self.restart_reason    = ""
+        self.stage              = state["stage"]
+        self.policy_lr          = state["policy_lr"]
+        self.critic_lr          = state["critic_lr"]
+        self.ent_coef           = state["ent_coef"]
+        self.clip_high_count    = state.get("clip_high_count", 0)
+        self.val_loss_high_count = state.get("val_loss_high_count", 0)
+        self.stage_iter_count   = state.get("stage_iter_count", 0)
+        self.entropy_low_count  = state.get("entropy_low_count", 0)
+        self.restart_requested  = False
+        self.restart_reason     = ""
 
     def to_state_dict(self):
         return {
             "stage": self.stage, "policy_lr": self.policy_lr,
             "critic_lr": self.critic_lr, "ent_coef": self.ent_coef,
             "clip_high_count": self.clip_high_count,
+            "val_loss_high_count": self.val_loss_high_count,
             "stage_iter_count": self.stage_iter_count,
             "entropy_low_count": self.entropy_low_count,
         }
@@ -94,6 +99,7 @@ class CurriculumTracker:
     def update(self, mean_reward, entropy, clip_fraction, value_loss):
         self.stage_iter_count += 1
 
+        # ── Policy LR decay: clip fraction too high ──
         if clip_fraction > self.CLIP_HIGH_THRESH:
             self.clip_high_count += 1
         else:
@@ -110,7 +116,25 @@ class CurriculumTracker:
                 self.restart_requested = True
                 return True
 
-        if self.stage < 3:
+        # ── Critic LR decay: value loss too high ──
+        if value_loss > self.VAL_LOSS_HIGH_THRESH:
+            self.val_loss_high_count += 1
+        else:
+            self.val_loss_high_count = 0
+
+        if self.val_loss_high_count >= self.VAL_LOSS_HIGH_ITERS:
+            new_lr = round(self.critic_lr * 0.80, 7)
+            if new_lr >= 1e-4:
+                self.critic_lr = new_lr
+                self.val_loss_high_count = 0
+                self.restart_reason = (
+                    f"Value loss >{self.VAL_LOSS_HIGH_THRESH} for "
+                    f"{self.VAL_LOSS_HIGH_ITERS} iters — critic_lr → {self.critic_lr:.2e}")
+                self.restart_requested = True
+                return True
+
+        # ── Stage advance check ──
+        if self.stage < 5:
             floor = self.ENTROPY_ADVANCE[self.stage]
             min_iters = self.MIN_STAGE_ITERS[self.stage]
             if entropy < floor:
@@ -123,6 +147,10 @@ class CurriculumTracker:
                 self.stage += 1
                 self.stage_iter_count = 0
                 self.entropy_low_count = 0
+                self.clip_high_count = 0
+                self.val_loss_high_count = 0
+                self.policy_lr = 3e-4
+                self.critic_lr = 3e-4
                 self.restart_reason = (
                     f"STAGE ADVANCE {old_stage} → {self.stage} "
                     f"({CURRICULUM_STAGE_NAMES[self.stage]})")
@@ -174,8 +202,8 @@ class GPULearner:
             batch_size=50000,
             mini_batch_size=50000,
             n_epochs=2,
-            policy_layer_sizes=(2048, 2048, 1024, 1024),
-            critic_layer_sizes=(2048, 2048, 1024, 1024),
+            policy_layer_sizes=(1024, 1024, 1024, 512),
+            critic_layer_sizes=(1024, 1024, 1024, 512),
             policy_lr=self.curriculum.policy_lr,
             critic_lr=self.curriculum.critic_lr,
             clip_range=0.2,
@@ -453,10 +481,12 @@ class GPULearner:
 if __name__ == "__main__":
     # ── Configuration ──
     # n_envs is read from STAGE_CONFIG per stage:
-    #   Stage 0 (1v0): 160k envs x 1 agent
-    #   Stage 1 (1v1): 80k envs x 2 agents
-    #   Stage 2 (1v1): 80k envs x 2 agents
-    #   Stage 3 (2v2): 40k envs x 4 agents
+    #   Stage 0 (1v0): 160k envs x 1 agent  — Ground Basics
+    #   Stage 1 (1v0): 160k envs x 1 agent  — Ground Advanced
+    #   Stage 2 (1v0): 160k envs x 1 agent  — Air Mechanics
+    #   Stage 3 (1v1): 80k envs x 2 agents  — 1v1 Basics
+    #   Stage 4 (1v1): 80k envs x 2 agents  — 1v1 Advanced
+    #   Stage 5 (2v2): 40k envs x 4 agents  — 2v2 Teamwork
     TS_PER_ITERATION = 200000
 
     print(f"\n[*] LuciferBot")

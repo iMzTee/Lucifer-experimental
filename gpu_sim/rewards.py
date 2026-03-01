@@ -17,10 +17,12 @@ from .constants import (
 #  R9:AirControl, R10:FlipReset, R11:AngVel, R12:Speed, R13:BallAccel,
 #  R14:SpeedFlip, R15:WaveDash, R16:WallDrive, R17:AirDribble]
 STAGE_WEIGHTS = {
-    0: [2.0, 1.0, 2.0, 2.0, 3.0, 0.0, 0.5, 0.0, 0.5, 0.0,  0.0,   1.0, 1.5,  3.0, 2.0, 0.0, 0.0],
-    1: [5.0, 3.0, 3.0, 1.5, 2.0, 0.5, 1.0, 0.5, 1.5, 0.0,  0.005, 0.5, 2.0,  2.0, 2.0, 1.0, 3.0],
-    2: [5.0, 3.0, 3.0, 1.0, 2.0, 1.5, 1.0, 1.0, 2.0, 5.0,  0.005, 0.3, 2.0,  1.0, 1.0, 0.5, 2.0],
-    3: [5.0, 3.0, 3.0, 0.5, 2.0, 1.5, 1.0, 1.0, 2.0, 10.0, 0.005, 0.2, 2.0,  0.5, 0.5, 0.5, 1.0],
+    0: [2.0, 1.0, 2.0, 2.0, 3.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0,   1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    1: [2.0, 1.0, 2.0, 2.0, 3.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0,   1.0, 0.5, 3.0, 2.0, 1.0, 0.0],
+    2: [3.0, 1.5, 2.5, 1.5, 2.0, 0.0, 0.5, 0.0, 1.5, 0.0, 0.005, 1.0, 1.5, 2.0, 2.0, 1.0, 0.0],
+    3: [5.0, 3.0, 3.0, 1.5, 2.0, 0.5, 1.0, 0.5, 1.5, 0.0, 0.005, 0.5, 2.0, 2.0, 2.0, 1.0, 0.0],
+    4: [5.0, 3.0, 3.0, 1.0, 2.0, 1.5, 1.0, 1.0, 2.0, 5.0, 0.005, 0.3, 2.0, 1.0, 1.0, 0.5, 3.0],
+    5: [5.0, 3.0, 3.0, 0.5, 2.0, 1.5, 1.0, 1.0, 2.0,10.0, 0.005, 0.2, 2.0, 0.5, 0.5, 0.5, 1.0],
 }
 
 EVENT_WEIGHTS = {
@@ -28,9 +30,11 @@ EVENT_WEIGHTS = {
     1: [10.0, 0.0, -7.0, 0.5, 3.0, 5.0, 8.0, 0.0],
     2: [10.0, 0.0, -7.0, 0.5, 3.0, 5.0, 8.0, 0.0],
     3: [10.0, 0.0, -7.0, 0.5, 3.0, 5.0, 8.0, 0.0],
+    4: [10.0, 0.0, -7.0, 0.5, 3.0, 5.0, 8.0, 0.0],
+    5: [10.0, 0.0, -7.0, 0.5, 3.0, 5.0, 8.0, 0.0],
 }
 
-TEAM_SPIRIT = {0: 0.0, 1: 0.0, 2: 0.3, 3: 0.6}
+TEAM_SPIRIT = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.6}
 
 
 class GPURewards:
@@ -65,7 +69,7 @@ class GPURewards:
         # Pre-allocate weight tensors
         self._stage_weights = {}
         self._event_weights = {}
-        for s in range(4):
+        for s in range(6):
             self._stage_weights[s] = torch.tensor(STAGE_WEIGHTS[s], device=device)
             self._event_weights[s] = torch.tensor(EVENT_WEIGHTS[s], device=device)
 
@@ -118,8 +122,8 @@ class GPURewards:
         A = self.n_agents
         s = state
         layout = self.layout
-        weights = self._stage_weights.get(stage, self._stage_weights[3])
-        ev_weights = self._event_weights.get(stage, self._event_weights[3])
+        weights = self._stage_weights.get(stage, self._stage_weights[5])
+        ev_weights = self._event_weights.get(stage, self._event_weights[5])
         ts = TEAM_SPIRIT.get(stage, 0.6)
 
         # ── Precompute common values ──

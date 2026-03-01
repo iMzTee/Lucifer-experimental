@@ -172,10 +172,12 @@ def get_agent_layout(n_agents):
 
 # ── Curriculum ──
 STAGE_CONFIG = {
-    0: {"tick_skip": 2, "timeout": 1800, "n_agents": 1, "n_envs": 160000},
-    1: {"tick_skip": 2, "timeout": 2400, "n_agents": 2, "n_envs": 80000},
-    2: {"tick_skip": 2, "timeout": 3600, "n_agents": 2, "n_envs": 80000},
-    3: {"tick_skip": 2, "timeout": 4800, "n_agents": 4, "n_envs": 40000},
+    0: {"tick_skip": 2, "timeout": 1800, "n_agents": 1, "n_envs": 160000},  # Ground Basics
+    1: {"tick_skip": 2, "timeout": 1800, "n_agents": 1, "n_envs": 160000},  # Ground Advanced
+    2: {"tick_skip": 2, "timeout": 2400, "n_agents": 1, "n_envs": 160000},  # Air Mechanics
+    3: {"tick_skip": 2, "timeout": 2400, "n_agents": 2, "n_envs": 80000},   # 1v1 Basics
+    4: {"tick_skip": 2, "timeout": 3600, "n_agents": 2, "n_envs": 80000},   # 1v1 Advanced
+    5: {"tick_skip": 2, "timeout": 4800, "n_agents": 4, "n_envs": 40000},   # 2v2 Teamwork
 }
 
 # Physics tick rate
