@@ -136,8 +136,10 @@ class VisSender:
             state.ball_pos[i], state.ball_vel[i], state.ball_ang_vel[i]
         ]).cpu()  # (3, 3)
 
+        car_vel_xy = state.car_vel[i].clone()
+        car_vel_xy[:, 2] = 0  # zero vel_z: prevents upward extrapolation drift
         car_vecs = torch.stack([
-            state.car_pos[i], state.car_vel[i], state.car_ang_vel[i],
+            state.car_pos[i], car_vel_xy, state.car_ang_vel[i],
             state.car_fwd[i], state.car_up[i],
         ])  # (5, A, 3)
         car_scalars = torch.stack([
