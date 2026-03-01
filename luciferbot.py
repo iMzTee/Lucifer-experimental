@@ -183,16 +183,18 @@ class GPULearner:
         n_envs = cfg.get("n_envs", 40000)
         n_agents = cfg.get("n_agents", 4)
 
+        # Visualization sender (zero overhead when disabled)
+        vis_enabled = os.environ.get("VIS", "0") == "1"
+        if vis_enabled:
+            n_envs = 500  # cap for smooth vis (more steps per iteration)
+        vis_sender = VisSender(n_envs=n_envs, enabled=vis_enabled) if vis_enabled else None
+
         stage_name = CURRICULUM_STAGE_NAMES[stage]
         print(f"\n{'='*60}")
         print(f"  LuciferBot — Stage {stage}: {stage_name}")
         print(f"  {n_envs:,} envs x {n_agents} agents on GPU")
         print(f"  Steps per iteration: {ts_per_iteration:,}")
         print(f"{'='*60}")
-
-        # Visualization sender (zero overhead when disabled)
-        vis_enabled = os.environ.get("VIS", "0") == "1"
-        vis_sender = VisSender(n_envs=n_envs, enabled=vis_enabled) if vis_enabled else None
         if vis_enabled:
             print("[*] Visualization enabled — cycling envs every 5s (UDP 127.0.0.1:9273)")
             print("[*] Start viewer: cd rocketsimvis && python main.py")

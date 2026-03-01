@@ -110,6 +110,8 @@ class GPUCollector:
         cfg = STAGE_CONFIG.get(stage, STAGE_CONFIG[0])
         new_n_agents = cfg.get("n_agents", 4)
         new_n_envs = cfg.get("n_envs", self.n_envs)
+        if self.vis_sender is not None and self.vis_sender.enabled:
+            new_n_envs = min(new_n_envs, 500)
 
         if new_n_agents != self.n_agents or new_n_envs != self.n_envs:
             # Full re-init needed
