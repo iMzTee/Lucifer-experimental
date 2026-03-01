@@ -14,8 +14,10 @@ from .constants import (
     CAR_WHEELBASE, CAR_MAX_ANG_SPEED,
     THROTTLE_TORQUE_SPEEDS, THROTTLE_TORQUE_FACTORS,
     STEER_ANGLE_SPEEDS, STEER_ANGLE_VALUES,
+    POWERSLIDE_STEER_SPEEDS, POWERSLIDE_STEER_VALUES,
     PITCH_TORQUE, YAW_TORQUE, ROLL_TORQUE,
-    ANG_VEL_DAMPING, AIR_THROTTLE_ACCEL,
+    PITCH_ANG_DAMPING, YAW_ANG_DAMPING, ROLL_ANG_DAMPING,
+    AIR_THROTTLE_ACCEL,
     JUMP_IMPULSE, JUMP_HOLD_FORCE, JUMP_HOLD_TIME,
     FLIP_IMPULSE, FLIP_FORWARD_SCALE, FLIP_SIDE_SCALE,
     FLIP_BACKWARD_SCALE, FLIP_BACKWARD_X_SCALE, FLIP_Z_DAMP,
@@ -38,6 +40,8 @@ def _get_curves(device):
             'throttle_factors': torch.tensor(THROTTLE_TORQUE_FACTORS, device=device),
             'steer_speeds': torch.tensor(STEER_ANGLE_SPEEDS, device=device),
             'steer_angles': torch.tensor(STEER_ANGLE_VALUES, device=device),
+            'powerslide_steer_speeds': torch.tensor(POWERSLIDE_STEER_SPEEDS, device=device),
+            'powerslide_steer_angles': torch.tensor(POWERSLIDE_STEER_VALUES, device=device),
         }
     return _curve_cache[device]
 
@@ -109,11 +113,14 @@ def apply_car_controls(state, actions, dt=DT):
     state.car_vel -= (coast_decel * coast_mask.float()).unsqueeze(-1) * fwd
 
     # ── Steering: speed-dependent steer angle curve ──
-    # Look up steer angle from speed, compute yaw rate = speed * angle / wheelbase
     steer_angle = _piecewise_linear(
         abs_speed, curves['steer_speeds'], curves['steer_angles'])
-    # yaw_rate = forward_speed * steer_angle * steer / wheelbase
-    # (signed: reversing + steer right = turn left, like real car)
+    handbrake_active = handbrake > 0.5  # (E, A)
+    if handbrake_active.any():
+        powerslide_angle = _piecewise_linear(
+            abs_speed, curves['powerslide_steer_speeds'], curves['powerslide_steer_angles'])
+        steer_angle = torch.where(handbrake_active, powerslide_angle, steer_angle)
+
     steer_rate = forward_speed * steer_angle * steer / CAR_WHEELBASE  # (E, A)
     ground_mask = on_ground.float()  # (E, A)
 
@@ -130,22 +137,41 @@ def apply_car_controls(state, actions, dt=DT):
     # ── Air physics ──
     air_mask = in_air.float()  # (E, A)
 
-    # Air torques
+    # Air torques (in car's local frame axes)
     air_torque = torch.stack([
         roll_in * ROLL_TORQUE,
         pitch_in * PITCH_TORQUE,
         yaw_in * YAW_TORQUE,
     ], dim=-1)  # (E, A, 3)
 
-    # Angular velocity damping in air (Python scalars — no per-tick GPU alloc)
-    state.car_ang_vel *= torch.where(in_air.unsqueeze(-1), ANG_VEL_DAMPING, 1.0)
+    # Per-axis angular velocity damping in air (RocketSim model)
+    # Pitch/yaw damping scales with (1 - |input|): zero when holding full input
+    # Roll damping is always active regardless of input
+    if in_air.any():
+        fwd = state.car_fwd                                      # (E, A, 3)
+        right = torch.cross(state.car_up, fwd, dim=-1)           # (E, A, 3)
+        up = state.car_up                                         # (E, A, 3)
+
+        # Project angular velocity onto car-local axes
+        ang_pitch = (state.car_ang_vel * right).sum(dim=-1)  # (E, A)
+        ang_yaw = (state.car_ang_vel * up).sum(dim=-1)       # (E, A)
+        ang_roll = (state.car_ang_vel * fwd).sum(dim=-1)     # (E, A)
+
+        # Input-dependent damping factors
+        pitch_damp = PITCH_ANG_DAMPING * (1.0 - torch.abs(pitch_in))  # (E, A)
+        yaw_damp = YAW_ANG_DAMPING * (1.0 - torch.abs(yaw_in))       # (E, A)
+        roll_damp = ROLL_ANG_DAMPING  # always active (Python float)
+
+        # Subtract damping torques
+        damp_vec = (
+            (ang_pitch * pitch_damp).unsqueeze(-1) * right +
+            (ang_yaw * yaw_damp).unsqueeze(-1) * up +
+            (ang_roll * roll_damp).unsqueeze(-1) * fwd
+        )  # (E, A, 3)
+        state.car_ang_vel -= damp_vec * dt * air_mask.unsqueeze(-1)
 
     # Apply air torques
     state.car_ang_vel += air_torque * dt * air_mask.unsqueeze(-1)
-
-    # Air throttle (very weak forward push)
-    air_throttle = throttle * AIR_THROTTLE_ACCEL
-    state.car_vel += (air_throttle.unsqueeze(-1) * fwd * dt * air_mask.unsqueeze(-1))
 
     # ── Angular velocity cap ──
     ang_speed = state.car_ang_vel.norm(dim=-1, keepdim=True)  # (E, A, 1)
@@ -154,6 +180,10 @@ def apply_car_controls(state, actions, dt=DT):
         CAR_MAX_ANG_SPEED / ang_speed.clamp(min=1e-6),
         1.0,
     )
+
+    # Air throttle (very weak forward push)
+    air_throttle = throttle * AIR_THROTTLE_ACCEL
+    state.car_vel += (air_throttle.unsqueeze(-1) * fwd * dt * air_mask.unsqueeze(-1))
 
     # ── Boost (ground/air have different acceleration) ──
     boost_active = (boost > 0.5) & (state.car_boost > 0.005) & alive  # (E, A)
@@ -166,7 +196,7 @@ def apply_car_controls(state, actions, dt=DT):
     # ── Jump mechanics ──
     _apply_jump_flip(state, jump, pitch_in, yaw_in, forward_speed, dt)
 
-    # ── Gravity (zero-alloc: split ground/air paths) ──
+    # ── Gravity (surface-relative when on surface, standard downward in air) ──
     grav = GRAVITY * dt
     on_ground_f = on_ground.float()
     state.car_vel += state.car_surface_normal * grav * on_ground_f.unsqueeze(-1)

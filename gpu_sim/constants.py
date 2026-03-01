@@ -50,18 +50,27 @@ THROTTLE_TORQUE_FACTORS = [1.0, 0.1, 0.0]
 # Boost
 BOOST_ACCEL_GROUND = 991.667  # uu/s² boost on ground (2975/3)
 BOOST_ACCEL_AIR = 1058.333    # uu/s² boost in air (3175/3)
-BOOST_CONSUMPTION = 33.3      # boost per second (100 boost lasts 3s)
+BOOST_CONSUMPTION = 1.0 / 3.0  # boost per second in 0-1 scale (full boost lasts 3s)
 
 # Steering: speed-dependent steer angle curve (piecewise linear)
 # abs(speed) → steer_angle (radians) at full steer input
 STEER_ANGLE_SPEEDS = [0.0, 500.0, 1000.0, 1500.0, 1750.0, 3000.0]
 STEER_ANGLE_VALUES = [0.53356, 0.31930, 0.18203, 0.10570, 0.08507, 0.03454]
 
+# Powerslide steer angle curve (used when handbrake active, interpolated with normal curve)
+POWERSLIDE_STEER_SPEEDS = [0.0, 2500.0]
+POWERSLIDE_STEER_VALUES = [0.39235, 0.12610]
+
 # ── Air car physics ──
 PITCH_TORQUE = 12.46          # rad/s² pitch (130 * CAR_TORQUE_SCALE)
 YAW_TORQUE = 9.11             # rad/s² yaw (95 * CAR_TORQUE_SCALE)
 ROLL_TORQUE = 38.34           # rad/s² roll (400 * CAR_TORQUE_SCALE)
-ANG_VEL_DAMPING = 0.988       # per-tick angular velocity damping (120Hz)
+# Per-axis angular velocity damping rates (per second, from RocketSim CAR_AIR_CONTROL_DAMPING)
+# Pitch/yaw damping scales with (1 - |input|): zero when holding full input
+# Roll damping is always active regardless of input
+PITCH_ANG_DAMPING = 2.876     # 30 * CAR_TORQUE_SCALE
+YAW_ANG_DAMPING = 1.917       # 20 * CAR_TORQUE_SCALE
+ROLL_ANG_DAMPING = 4.794      # 50 * CAR_TORQUE_SCALE
 AIR_THROTTLE_ACCEL = 66.667   # uu/s² air throttle (200/3)
 CAR_MAX_ANG_SPEED = 5.5       # rad/s max angular velocity magnitude
 

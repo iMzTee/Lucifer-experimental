@@ -1,6 +1,6 @@
 """collision.py — Ball-car and car-car collision detection + response.
 
-Simplified sphere-sphere model for ball-car collision.
+OBB-sphere model for ball-car collision (oriented bounding box hitbox).
 Pair-wise checks for car-car demos and bumps.
 Supports variable n_agents (1v0, 1v1, 2v2).
 """
@@ -9,31 +9,66 @@ import torch
 from .constants import (
     BALL_RADIUS, CAR_EFFECTIVE_RADIUS, BALL_MAX_SPEED, CAR_MAX_SPEED,
     CAR_SUPERSONIC_SPEED, DEMO_RESPAWN_TIME,
+    CAR_HITBOX_LENGTH, CAR_HITBOX_WIDTH, CAR_HITBOX_HEIGHT, CAR_HITBOX_OFFSET,
+    BALL_MASS, CAR_MASS, BALL_RESTITUTION,
 )
+from .utils import quat_rotate_vector, quat_conjugate
+
+# ── Cached hitbox constants (created once per device) ──
+_hitbox_cache = {}
+
+
+def _get_hitbox_tensors(device):
+    """Lazily create and cache hitbox constant tensors on device."""
+    if device not in _hitbox_cache:
+        _hitbox_cache[device] = {
+            'offset': torch.tensor(CAR_HITBOX_OFFSET, dtype=torch.float32, device=device),
+            'half_extents': torch.tensor([
+                CAR_HITBOX_LENGTH / 2,
+                CAR_HITBOX_WIDTH / 2,
+                CAR_HITBOX_HEIGHT / 2,
+            ], dtype=torch.float32, device=device),
+        }
+    return _hitbox_cache[device]
 
 
 def ball_car_collision(state):
-    """Detect and resolve ball-car collisions using sphere-sphere model.
+    """Detect and resolve ball-car collisions using OBB-sphere model.
+
+    Uses the car's oriented bounding box (hitbox) for collision detection
+    and proper mass-based impulse for response.
 
     Returns: (E, A) float tensor of touches (1.0 where car touched ball).
-    Modifies state.ball_pos, state.ball_vel in-place.
+    Modifies state.ball_pos, state.ball_vel, state.car_vel in-place.
     """
-    A = state.n_agents
+    hb = _get_hitbox_tensors(state.device)
+    hitbox_offset = hb['offset']       # (3,)
+    half_extents = hb['half_extents']  # (3,)
 
-    # Expand ball for broadcasting: (E, 1, 3)
+    # Ball (E, 3) → (E, 1, 3) for agent broadcasting
     ball_pos = state.ball_pos.unsqueeze(1)  # (E, 1, 3)
     ball_vel = state.ball_vel.unsqueeze(1)  # (E, 1, 3)
 
-    # Offset car position to hitbox center (approximate)
-    car_center = state.car_pos + state.car_fwd * 13.88  # hitbox offset
-    car_center[:, :, 2] += 20.75  # height offset
+    car_pos = state.car_pos   # (E, A, 3)
+    car_quat = state.car_quat  # (E, A, 4)
 
-    # Distance check
-    diff = ball_pos - car_center  # (E, A, 3)
-    dist = diff.norm(dim=-1)  # (E, A)
-    contact_dist = BALL_RADIUS + CAR_EFFECTIVE_RADIUS
+    # ── Transform ball into car's local frame ──
+    diff = ball_pos - car_pos  # (E, A, 3)
+    q_inv = quat_conjugate(car_quat)  # (E, A, 4)
+    local_diff = quat_rotate_vector(q_inv, diff)  # (E, A, 3)
 
-    colliding = dist < contact_dist  # (E, A)
+    # Offset to hitbox center in local frame
+    local_diff = local_diff - hitbox_offset  # (E, A, 3) broadcast (3,)
+
+    # ── Closest point on OBB ──
+    closest_local = local_diff.clamp(-half_extents, half_extents)  # (E, A, 3)
+    local_sep = local_diff - closest_local  # (E, A, 3)
+
+    # Transform separation back to world frame
+    world_sep = quat_rotate_vector(car_quat, local_sep)  # (E, A, 3)
+
+    dist = world_sep.norm(dim=-1)  # (E, A)
+    colliding = dist < BALL_RADIUS  # (E, A)
 
     # Alive check
     alive = state.car_is_demoed < 0.5  # (E, A)
@@ -42,45 +77,60 @@ def ball_car_collision(state):
     if not colliding.any():
         return torch.zeros_like(dist)
 
-    # Collision normal (ball - car direction)
-    normal = diff / (dist.unsqueeze(-1) + 1e-6)  # (E, A, 3)
+    # ── Collision normal ──
+    # Normal case: ball surface to closest OBB point
+    normal = world_sep / (dist.unsqueeze(-1) + 1e-6)  # (E, A, 3)
 
-    # Relative velocity (ball - car)
+    # Fallback for ball center inside OBB (dist ≈ 0): use center-to-center
+    hitbox_world_offset = quat_rotate_vector(car_quat, hitbox_offset)  # (E, A, 3)
+    center_diff = ball_pos - (car_pos + hitbox_world_offset)  # (E, A, 3)
+    center_normal = center_diff / (center_diff.norm(dim=-1, keepdim=True) + 1e-6)
+    inside_obb = dist < 1e-3
+    normal = torch.where(inside_obb.unsqueeze(-1), center_normal, normal)
+
+    # ── Relative velocity and approach check ──
     rel_vel = ball_vel - state.car_vel  # (E, A, 3)
-    rel_speed = (rel_vel * normal).sum(dim=-1)  # (E, A)
+    v_rel_n = (rel_vel * normal).sum(dim=-1)  # (E, A)
 
-    # Only collide if approaching
-    approaching = rel_speed < 0
+    approaching = v_rel_n < 0
     active = colliding & approaching  # (E, A)
 
     if not active.any():
         return colliding.float()
 
-    # Impulse: ball is lighter, so it gets most of the velocity change
-    impulse_mag = -1.8 * rel_speed  # (E, A)
-    impulse = impulse_mag.unsqueeze(-1) * normal  # (E, A, 3)
+    # ── Mass-based impulse: j = -(1+e) * v_rel_n / (1/m_ball + 1/m_car) ──
+    inv_mass_sum = 1.0 / BALL_MASS + 1.0 / CAR_MASS  # Python float
+    j = -(1.0 + BALL_RESTITUTION) * v_rel_n / inv_mass_sum  # (E, A)
+
+    ball_dv = (j / BALL_MASS).unsqueeze(-1) * normal   # (E, A, 3)
+    car_dv = -(j / CAR_MASS).unsqueeze(-1) * normal    # (E, A, 3)
+
+    active_f = active.unsqueeze(-1).float()  # (E, A, 1)
 
     # Apply impulse to ball (sum across all colliding cars)
-    active_f = active.unsqueeze(-1).float()  # (E, A, 1)
-    ball_impulse = (impulse * active_f).sum(dim=1)  # (E, 3)
-    state.ball_vel += ball_impulse
+    state.ball_vel += (ball_dv * active_f).sum(dim=1)  # (E, 3)
 
-    # Ball speed cap after collision
+    # Apply impulse to car
+    state.car_vel += car_dv * active_f  # (E, A, 3)
+
+    # ── Speed caps ──
     ball_speed = state.ball_vel.norm(dim=-1, keepdim=True)
     state.ball_vel *= torch.where(
         ball_speed > BALL_MAX_SPEED,
         BALL_MAX_SPEED / ball_speed.clamp(min=1e-6),
         torch.ones_like(ball_speed),
     )
+    car_speed = state.car_vel.norm(dim=-1, keepdim=True)
+    state.car_vel *= torch.where(
+        car_speed > CAR_MAX_SPEED,
+        CAR_MAX_SPEED / car_speed.clamp(min=1e-6),
+        torch.ones_like(car_speed),
+    )
 
-    # Separate ball from car (push ball out of overlap)
-    overlap = (contact_dist - dist).clamp(min=0)  # (E, A)
+    # ── Separate ball from car (push out of overlap) ──
+    overlap = (BALL_RADIUS - dist).clamp(min=0)  # (E, A)
     push = normal * overlap.unsqueeze(-1) * active_f  # (E, A, 3)
     state.ball_pos += push.sum(dim=1)  # (E, 3)
-
-    # Small pushback on car too (reaction force)
-    car_pushback = -normal * overlap.unsqueeze(-1) * active_f * 0.15
-    state.car_vel += car_pushback * 50.0 * (1.0 / 120.0)
 
     return colliding.float()
 
