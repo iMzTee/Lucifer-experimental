@@ -1,9 +1,9 @@
 """vis_sender.py — Lightweight UDP sender for RocketSimVis.
 
-Sends game state over UDP to localhost:9273. During collection bursts,
-sends real positions+velocities so RocketSimVis interpolates smoothly.
-When no new physics arrives (training phase), holds the last position
-with zero velocity to prevent drift.
+Sends game state over UDP to localhost:9273. During collection, send()
+transmits directly for real-time updates. Between collections, the
+background thread extrapolates positions using last known velocity so
+movement continues smoothly. After STALE_TIMEOUT, objects freeze.
 
 Cycles through random envs every few seconds. Zero overhead when disabled.
 """
@@ -19,9 +19,9 @@ import torch
 class VisSender:
     """Sends game state to RocketSimVis over UDP.
 
-    During collection, raw physics states stream at full speed. Between
-    collections, the background thread resends the last state with zero
-    velocity so objects freeze in place instead of drifting.
+    During collection, send() fires immediately for real-time vis.
+    Between collections, the background thread extrapolates positions
+    using last known XY velocity for smooth continued motion.
 
     Args:
         n_envs: Total number of environments (for cycling).
@@ -60,9 +60,16 @@ class VisSender:
         self._last_switch = time.time()
         print(f"[VIS] Switched to env {self.env_idx}")
 
+    def _send_udp(self, packet):
+        """Send a packet over UDP (no-throw)."""
+        try:
+            self._sock.sendto(json.dumps(packet).encode("utf-8"), self._addr)
+        except OSError:
+            pass
+
     @staticmethod
     def _zero_vel(packet):
-        """Copy packet with all velocities zeroed."""
+        """Copy packet with all velocities zeroed (freeze in place)."""
         result = {
             "ball_phys": {
                 "pos": packet["ball_phys"]["pos"],
@@ -89,8 +96,48 @@ class VisSender:
             })
         return result
 
+    @staticmethod
+    def _extrapolate(packet, dt):
+        """Extrapolate positions forward by dt using XY velocity.
+
+        Car vel_z is already zeroed in send(), so only XY moves.
+        Ball Z is also kept fixed to avoid gravity drift artifacts.
+        """
+        ball = packet["ball_phys"]
+        result = {
+            "ball_phys": {
+                "pos": [
+                    ball["pos"][0] + ball["vel"][0] * dt,
+                    ball["pos"][1] + ball["vel"][1] * dt,
+                    ball["pos"][2],  # no Z extrapolation
+                ],
+                "vel": ball["vel"],
+                "ang_vel": ball["ang_vel"],
+            },
+            "cars": [],
+            "boost_pad_states": packet["boost_pad_states"],
+        }
+        for c in packet["cars"]:
+            pos = c["phys"]["pos"]
+            vel = c["phys"]["vel"]
+            result["cars"].append({
+                "team_num": c["team_num"],
+                "phys": {
+                    "pos": [pos[0] + vel[0] * dt, pos[1] + vel[1] * dt, pos[2]],
+                    "vel": vel,
+                    "ang_vel": c["phys"]["ang_vel"],
+                    "forward": c["phys"]["forward"],
+                    "up": c["phys"]["up"],
+                },
+                "boost_amount": c["boost_amount"],
+                "on_ground": c["on_ground"],
+                "is_demoed": c["is_demoed"],
+                "has_flip": c["has_flip"],
+            })
+        return result
+
     def _send_loop(self):
-        """Background: relay fresh frames or hold position at 30fps."""
+        """Background: extrapolate between collections, freeze when stale."""
         while not self._stop.is_set():
             now = time.time()
 
@@ -103,21 +150,17 @@ class VisSender:
                 packet = self._last_packet
                 age = now - self._last_send_time
 
-            if packet is not None:
-                # Fresh data → send with real velocity (RocketSimVis interpolates)
-                # Stale data → send with zero velocity (hold in place)
+            if packet is not None and age > 0.05:
+                # Only send from background if no recent direct send (>50ms)
                 if age > self.STALE_TIMEOUT:
-                    packet = self._zero_vel(packet)
-                try:
-                    self._sock.sendto(
-                        json.dumps(packet).encode("utf-8"), self._addr)
-                except OSError:
-                    pass
+                    self._send_udp(self._zero_vel(packet))
+                else:
+                    self._send_udp(self._extrapolate(packet, age))
 
             self._stop.wait(1.0 / 30)
 
     def send(self, state):
-        """Snapshot the current env's state.
+        """Snapshot the current env's state and send immediately.
 
         Args:
             state: TensorState from GPUEnvironment.
@@ -129,9 +172,6 @@ class VisSender:
         n_agents = state.n_agents
 
         # ── Single GPU→CPU transfer: batch all reads into one .cpu() call ──
-        # Ball: 3 vectors (pos, vel, ang_vel) = 9 floats
-        # Per car: 5 vectors (pos, vel, ang_vel, fwd, up) = 15 floats + 4 scalars
-        # Stack everything, transfer once, unpack on CPU
         ball_data = torch.stack([
             state.ball_pos[i], state.ball_vel[i], state.ball_ang_vel[i]
         ]).cpu()  # (3, 3)
@@ -185,6 +225,9 @@ class VisSender:
         with self._lock:
             self._last_packet = packet
             self._last_send_time = time.time()
+
+        # Send immediately — don't wait for background loop
+        self._send_udp(packet)
 
     def close(self):
         self._stop.set()
