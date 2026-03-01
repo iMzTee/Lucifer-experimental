@@ -3,37 +3,102 @@
 Extracts a single env from TensorState, builds the JSON packet
 matching RocketSimVis protocol, and sends over UDP to localhost:9273.
 
-Uses a background thread to re-send the last known state at ~30fps,
-preventing RocketSimVis from extrapolating during training pauses.
-
-Zero overhead when disabled (no socket, no CPU transfers).
+Buffers snapshots during fast physics bursts and replays them in slow
+motion via a background thread, smoothly filling the gaps between
+collection phases. Zero overhead when disabled.
 """
 
 import socket
 import json
 import threading
 import time
+from collections import deque
+
+
+def _lerp(a, b, t):
+    """Linearly interpolate between two lists of floats."""
+    return [a[i] + (b[i] - a[i]) * t for i in range(len(a))]
+
+
+def _lerp_packet(p1, p2, t):
+    """Interpolate all physics fields between two packets."""
+    result = {
+        "ball_phys": {
+            "pos": _lerp(p1["ball_phys"]["pos"], p2["ball_phys"]["pos"], t),
+            "vel": _lerp(p1["ball_phys"]["vel"], p2["ball_phys"]["vel"], t),
+            "ang_vel": _lerp(p1["ball_phys"]["ang_vel"], p2["ball_phys"]["ang_vel"], t),
+        },
+        "cars": [],
+        "boost_pad_states": p2["boost_pad_states"],
+    }
+    for c1, c2 in zip(p1["cars"], p2["cars"]):
+        result["cars"].append({
+            "team_num": c2["team_num"],
+            "phys": {
+                "pos": _lerp(c1["phys"]["pos"], c2["phys"]["pos"], t),
+                "vel": _lerp(c1["phys"]["vel"], c2["phys"]["vel"], t),
+                "ang_vel": _lerp(c1["phys"]["ang_vel"], c2["phys"]["ang_vel"], t),
+                "forward": _lerp(c1["phys"]["forward"], c2["phys"]["forward"], t),
+                "up": _lerp(c1["phys"]["up"], c2["phys"]["up"], t),
+            },
+            "boost_amount": c1["boost_amount"] + (c2["boost_amount"] - c1["boost_amount"]) * t,
+            "on_ground": c2["on_ground"],
+            "is_demoed": c2["is_demoed"],
+            "has_flip": c2["has_flip"],
+        })
+    return result
+
+
+def _zero_vel_packet(p):
+    """Return packet with all velocities zeroed (prevents extrapolation)."""
+    result = {
+        "ball_phys": {
+            "pos": p["ball_phys"]["pos"],
+            "vel": [0, 0, 0],
+            "ang_vel": [0, 0, 0],
+        },
+        "cars": [],
+        "boost_pad_states": p["boost_pad_states"],
+    }
+    for c in p["cars"]:
+        result["cars"].append({
+            "team_num": c["team_num"],
+            "phys": {
+                "pos": c["phys"]["pos"],
+                "vel": [0, 0, 0],
+                "ang_vel": [0, 0, 0],
+                "forward": c["phys"]["forward"],
+                "up": c["phys"]["up"],
+            },
+            "boost_amount": c["boost_amount"],
+            "on_ground": c["on_ground"],
+            "is_demoed": c["is_demoed"],
+            "has_flip": c["has_flip"],
+        })
+    return result
 
 
 class VisSender:
     """Sends game state to RocketSimVis over UDP.
 
-    A background thread continuously re-sends the last snapshot at ~30fps
-    so the viewer doesn't drift objects using stale velocities between
-    physics bursts.
+    Buffers physics snapshots during collection and replays them via a
+    background thread with interpolation, creating smooth slow-motion
+    playback that fills the gaps between physics bursts.
 
     Args:
         env_idx: Which environment index to visualize (default 0).
         enabled: If False, all methods are no-ops (zero overhead).
+        transition_secs: Seconds to interpolate between each pair of frames.
         port: UDP port for RocketSimVis (default 9273).
     """
 
-    def __init__(self, env_idx=0, enabled=False, port=9273):
+    def __init__(self, env_idx=0, enabled=False, transition_secs=2.0, port=9273):
         self.env_idx = env_idx
         self.enabled = enabled
         self.port = port
+        self.transition_secs = transition_secs
         self._sock = None
-        self._last_packet = None
+        self._queue = deque()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -45,19 +110,53 @@ class VisSender:
             self._thread.start()
 
     def _send_loop(self):
-        """Background thread: re-send last known state at ~30fps."""
+        """Background: interpolate between queued frames at 30fps."""
+        prev = None      # last completed frame
+        target = None     # interpolating toward this
+        interp_start = 0  # when interpolation began
+
         while not self._stop.is_set():
+            now = time.time()
+
+            # Grab new frames from queue
             with self._lock:
-                packet_bytes = self._last_packet
-            if packet_bytes is not None:
-                try:
-                    self._sock.sendto(packet_bytes, self._addr)
-                except OSError:
-                    pass
+                while self._queue:
+                    frame = self._queue.popleft()
+                    if prev is None:
+                        prev = frame
+                    else:
+                        # If we already had a target, skip to it
+                        if target is not None:
+                            prev = target
+                        target = frame
+                        interp_start = now
+
+            # Decide what to send
+            if prev is not None and target is not None:
+                elapsed = now - interp_start
+                t = min(elapsed / self.transition_secs, 1.0)
+                packet = _lerp_packet(prev, target, t)
+
+                # Transition done — advance
+                if t >= 1.0:
+                    prev = target
+                    target = None
+            elif prev is not None:
+                # Holding at last known position, zero velocity
+                packet = _zero_vel_packet(prev)
+            else:
+                self._stop.wait(1.0 / 30)
+                continue
+
+            try:
+                self._sock.sendto(json.dumps(packet).encode("utf-8"), self._addr)
+            except OSError:
+                pass
+
             self._stop.wait(1.0 / 30)
 
     def send(self, state):
-        """Snapshot a single env's state for the background sender.
+        """Snapshot a single env's state into the replay queue.
 
         Args:
             state: TensorState from GPUEnvironment.
@@ -68,14 +167,12 @@ class VisSender:
         i = self.env_idx
         n_agents = state.n_agents
 
-        # Ball physics
         ball_phys = {
             "pos": state.ball_pos[i].cpu().tolist(),
             "vel": state.ball_vel[i].cpu().tolist(),
             "ang_vel": state.ball_ang_vel[i].cpu().tolist(),
         }
 
-        # Cars
         cars = []
         for a in range(n_agents):
             car = {
@@ -94,7 +191,6 @@ class VisSender:
             }
             cars.append(car)
 
-        # Boost pad states: timer == 0 means active/available
         boost_pad_states = (state.boost_pad_timers[i] == 0).cpu().tolist()
 
         packet = {
@@ -103,9 +199,8 @@ class VisSender:
             "boost_pad_states": boost_pad_states,
         }
 
-        packet_bytes = json.dumps(packet).encode("utf-8")
         with self._lock:
-            self._last_packet = packet_bytes
+            self._queue.append(packet)
 
     def close(self):
         self._stop.set()
