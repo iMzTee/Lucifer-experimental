@@ -9,6 +9,7 @@ build/
 venv/
 Checkpoints_2v2/
 Checkpoints_2v2_gpu/
+Checkpoints_LuciferBot/
 temp/
 logs/
 wandb/

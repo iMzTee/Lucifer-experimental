@@ -1,11 +1,7 @@
-"""lucifer2_gpu.py — GPU-accelerated training script using gpu_sim.
+"""LuciferBot — GPU-accelerated Rocket League bot training.
 
-Minimal changes from lucifer2.py:
-- GPUCollector replaces VectorizedCollector
-- No rlgym_sim import (GPU sim replaces it)
-- No env_factory (GPU sim handles resets internally)
-- Adjustable n_envs (10,000-50,000 instead of 1,000)
-- Everything else identical: CurriculumTracker, PPO, AMP, pipeline parallelism
+GPU-resident pipeline: physics sim, reward computation, observation building,
+policy inference, GAE, and PPO training all stay on GPU end-to-end.
 """
 
 import os
@@ -80,7 +76,7 @@ def log_memory_usage(label):
     print(msg)
 
 
-# ─── AMP monkey-patch (identical to lucifer2.py) ───
+# ─── AMP monkey-patch ───
 def _amp_learn(self, exp):
     if not hasattr(self, '_grad_scaler'):
         self._grad_scaler = torch.amp.GradScaler('cuda')
@@ -167,7 +163,7 @@ def _amp_learn(self, exp):
     }
 
 
-# ─── CurriculumTracker (identical to lucifer2.py) ───
+# ─── CurriculumTracker ───
 class CurriculumTracker:
     ENTROPY_ADVANCE     = [0.5, 0.5, 0.5]
     ENTROPY_CONSECUTIVE = 3
@@ -245,7 +241,7 @@ class GPULearner:
     def __init__(self, n_envs=10000, ts_per_iteration=200000):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         assert self.device == "cuda", "GPU sim requires CUDA!"
-        self.checkpoints_folder = "Checkpoints_2v2_gpu"
+        self.checkpoints_folder = "Checkpoints_LuciferBot"
         self.epoch = 0
 
         curriculum_state = load_curriculum_state()
@@ -254,7 +250,7 @@ class GPULearner:
 
         stage_name = CURRICULUM_STAGE_NAMES[self.curriculum.stage]
         print(f"\n{'='*60}")
-        print(f"  LUCIFER GPU SIM — Stage {self.curriculum.stage}: {stage_name}")
+        print(f"  LuciferBot — Stage {self.curriculum.stage}: {stage_name}")
         print(f"  {n_envs:,} parallel environments on GPU")
         print(f"  Steps per iteration: {ts_per_iteration:,}")
         print(f"{'='*60}")
@@ -264,7 +260,7 @@ class GPULearner:
             n_envs=n_envs, device=self.device,
             standardize_obs=True, stage=self.curriculum.stage)
 
-        # PPO Learner (same architecture as lucifer2.py)
+        # PPO Learner
         self.ppo_learner = rlgym_ppo.ppo.PPOLearner(
             obs_space_size=127,
             act_space_size=8,
@@ -362,7 +358,7 @@ class GPULearner:
         sps = int(steps_gained / wall_time) if wall_time > 0 else 0
 
         print("\n\n" + "=" * 55)
-        print(f"  LUCIFER GPU v5.0 — Stage {stage} ({stage_name}) — Iter {epoch}")
+        print(f"  LuciferBot — Stage {stage} ({stage_name}) — Iter {epoch}")
         print("=" * 55)
         print(f"  Total Steps       : {cumul_steps:,}")
         print(f"  Steps Collected   : {steps_gained:,}")
@@ -386,7 +382,7 @@ class GPULearner:
             self.curriculum.restart_requested = False
 
         if epoch % 50 == 0:
-            self.save_checkpoint(f"lucifer_gpu_epoch_{epoch}")
+            self.save_checkpoint(f"luciferbot_epoch_{epoch}")
 
     def learn(self):
         iter_start = time.time()
@@ -529,7 +525,7 @@ class GPULearner:
 
     def load_latest_checkpoint(self):
         """Load from GPU checkpoints first, then fall back to CPU checkpoints."""
-        for folder in [self.checkpoints_folder, "Checkpoints_2v2"]:
+        for folder in [self.checkpoints_folder, "Checkpoints_2v2_gpu", "Checkpoints_2v2"]:
             if not os.path.exists(folder):
                 continue
             potential = [d for d in os.listdir(folder)
@@ -556,7 +552,7 @@ if __name__ == "__main__":
     N_ENVS = 40000
     TS_PER_ITERATION = 200000
 
-    print(f"\n[*] LUCIFER GPU SIMULATOR")
+    print(f"\n[*] LuciferBot")
     print(f"[*] Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
     if torch.cuda.is_available():
         vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**2
@@ -578,7 +574,7 @@ if __name__ == "__main__":
                     learner._finalize_prev_iteration(prev_report, prev_meta)
             except Exception:
                 pass
-            label = f"lucifer_gpu_manual_epoch_{learner.epoch}"
+            label = f"luciferbot_manual_epoch_{learner.epoch}"
             learner.save_checkpoint(label)
             save_curriculum_state(learner.curriculum.to_state_dict())
             print(f"[*] Checkpoint saved: {label}")

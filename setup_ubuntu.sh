@@ -1,10 +1,10 @@
 #!/bin/bash
-# Lucifer GPU Sim — Ubuntu Setup Script
+# LuciferBot — Ubuntu Setup Script
 # Run: chmod +x setup_ubuntu.sh && ./setup_ubuntu.sh
 
 set -e
 
-echo "=== Lucifer GPU Simulator — Ubuntu Setup ==="
+echo "=== LuciferBot — Ubuntu Setup ==="
 
 # 1. Clone repo
 echo ""
@@ -60,7 +60,7 @@ print('gpu_sim imports OK')
 print()
 print('=== Ready! Run with: ===')
 print('  source venv/bin/activate')
-print('  python -u lucifer2_gpu.py')
+print('  python -u luciferbot.py')
 "
 
 echo ""
@@ -68,4 +68,4 @@ echo "=== Setup complete! ==="
 echo "To start training:"
 echo "  cd ~/Lucifer"
 echo "  source venv/bin/activate"
-echo "  python -u lucifer2_gpu.py"
+echo "  python -u luciferbot.py"
