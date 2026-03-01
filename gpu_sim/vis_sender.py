@@ -30,7 +30,7 @@ class VisSender:
         port: UDP port for RocketSimVis (default 9273).
     """
 
-    STALE_TIMEOUT = 0.2  # seconds before switching to zero-velocity hold
+    STALE_TIMEOUT = 0.5  # seconds before switching to zero-velocity hold
 
     def __init__(self, n_envs=1, enabled=False, switch_interval=5.0, port=9273):
         self.n_envs = n_envs
