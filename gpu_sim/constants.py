@@ -115,18 +115,67 @@ BACK_NET_Y = 6000.0
 ORANGE_GOAL_BACK = torch.tensor([0.0, BACK_NET_Y, GOAL_HEIGHT / 2], dtype=torch.float32)
 BLUE_GOAL_BACK = torch.tensor([0.0, -BACK_NET_Y, GOAL_HEIGHT / 2], dtype=torch.float32)
 
-# ── 2v2 player layout: [B0, B1, O0, O1] ──
-ALLY_IDX = [1, 0, 3, 2]
-ENEMY0_IDX = [2, 2, 0, 0]
-ENEMY1_IDX = [3, 3, 1, 1]
-IS_ORANGE = [False, False, True, True]
+# ── Agent layout function ──
+def get_agent_layout(n_agents):
+    """Return layout dict for 1v0 / 1v1 / 2v2 configurations.
+
+    Returns dict with:
+        n_agents: total number of agents
+        blue_cars: list of car indices on blue team
+        orange_cars: list of car indices on orange team
+        car_pairs: list of (i,j) pairs for car-car collision
+        ally_idx: per-agent index of ally (-1 if none)
+        enemy0_idx: per-agent index of first enemy (-1 if none)
+        enemy1_idx: per-agent index of second enemy (-1 if none)
+        is_orange: per-agent bool
+        car_team: list of team assignments (0=blue, 1=orange)
+    """
+    if n_agents == 1:
+        # 1v0: solo blue car, no opponents
+        return {
+            "n_agents": 1,
+            "blue_cars": [0],
+            "orange_cars": [],
+            "car_pairs": [],
+            "ally_idx": [-1],
+            "enemy0_idx": [-1],
+            "enemy1_idx": [-1],
+            "is_orange": [False],
+            "car_team": [0],
+        }
+    elif n_agents == 2:
+        # 1v1: one blue (0), one orange (1)
+        return {
+            "n_agents": 2,
+            "blue_cars": [0],
+            "orange_cars": [1],
+            "car_pairs": [(0, 1)],
+            "ally_idx": [-1, -1],
+            "enemy0_idx": [1, 0],
+            "enemy1_idx": [-1, -1],
+            "is_orange": [False, True],
+            "car_team": [0, 1],
+        }
+    else:
+        # 2v2: [B0, B1, O0, O1]
+        return {
+            "n_agents": 4,
+            "blue_cars": [0, 1],
+            "orange_cars": [2, 3],
+            "car_pairs": [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)],
+            "ally_idx": [1, 0, 3, 2],
+            "enemy0_idx": [2, 2, 0, 0],
+            "enemy1_idx": [3, 3, 1, 1],
+            "is_orange": [False, False, True, True],
+            "car_team": [0, 0, 1, 1],
+        }
 
 # ── Curriculum ──
 STAGE_CONFIG = {
-    0: {"tick_skip": 8, "timeout": 300},
-    1: {"tick_skip": 8, "timeout": 400},
-    2: {"tick_skip": 4, "timeout": 600},
-    3: {"tick_skip": 2, "timeout": 1200},
+    0: {"tick_skip": 2, "timeout": 1800, "n_agents": 1, "n_envs": 160000},
+    1: {"tick_skip": 2, "timeout": 2400, "n_agents": 2, "n_envs": 80000},
+    2: {"tick_skip": 2, "timeout": 3600, "n_agents": 2, "n_envs": 80000},
+    3: {"tick_skip": 2, "timeout": 4800, "n_agents": 4, "n_envs": 40000},
 }
 
 # Physics tick rate

@@ -13,7 +13,10 @@ from .constants import (
     JUMP_IMPULSE, JUMP_HOLD_FORCE, JUMP_HOLD_TIME,
     FLIP_IMPULSE, FLIP_TIMER, DEMO_RESPAWN_TIME, DT,
 )
-from .utils import quat_integrate, quat_to_fwd_up, safe_normalize
+from .utils import (
+    quat_integrate, quat_to_fwd_up, safe_normalize,
+    quat_from_axis_angle, quat_multiply, quat_normalize,
+)
 
 
 def apply_car_controls(state, actions, dt=DT):
@@ -57,18 +60,20 @@ def apply_car_controls(state, actions, dt=DT):
     ground_accel = accel_mag.unsqueeze(-1) * fwd  # (E, 4, 3)
     state.car_vel += ground_accel * dt * on_ground.unsqueeze(-1).float()
 
-    # Steering (ground only): change angular velocity around Z axis
+    # Steering (ground only): rotate around surface normal (not always Z)
     speed_factor = 1.0 - 0.5 * torch.abs(forward_speed) / CAR_MAX_SPEED
-    steer_rate = steer * MAX_STEER_RATE * speed_factor  # (E, 4)
-    # Set yaw angular velocity on ground
-    ground_mask = on_ground.float()
-    state.car_ang_vel[:, :, 2] = (
-        steer_rate * ground_mask +
-        state.car_ang_vel[:, :, 2] * (1.0 - ground_mask)
+    steer_rate = steer * MAX_STEER_RATE * speed_factor  # (E, A)
+    ground_mask = on_ground.float()  # (E, A)
+
+    # Surface-relative steering: angular velocity = steer_rate * surface_normal
+    surf_normal = state.car_surface_normal  # (E, A, 3)
+    steer_ang_vel = steer_rate.unsqueeze(-1) * surf_normal  # (E, A, 3)
+
+    # On ground: set ang_vel to steering; in air: keep existing ang_vel
+    state.car_ang_vel = (
+        steer_ang_vel * ground_mask.unsqueeze(-1) +
+        state.car_ang_vel * (1.0 - ground_mask.unsqueeze(-1))
     )
-    # Zero out pitch/roll angular velocity on ground
-    state.car_ang_vel[:, :, 0] *= (1.0 - ground_mask)
-    state.car_ang_vel[:, :, 1] *= (1.0 - ground_mask)
 
     # ── Air physics ──
     air_mask = in_air.float()  # (E, 4)
@@ -104,8 +109,17 @@ def apply_car_controls(state, actions, dt=DT):
     # ── Jump mechanics ──
     _apply_jump_flip(state, jump, pitch_in, yaw_in, dt)
 
-    # ── Gravity ──
-    state.car_vel[:, :, 2] += GRAVITY * dt
+    # ── Gravity (surface-relative when on surface, standard downward in air) ──
+    # On surface: gravity pulls toward surface (-surface_normal * |GRAVITY|)
+    # In air: standard downward gravity (0, 0, GRAVITY)
+    surface_gravity = state.car_surface_normal * GRAVITY * dt  # (E, A, 3)
+    air_gravity = torch.zeros_like(state.car_vel)
+    air_gravity[:, :, 2] = GRAVITY * dt
+    state.car_vel += torch.where(
+        on_ground.unsqueeze(-1),
+        surface_gravity,
+        air_gravity,
+    )
 
     # ── Speed cap ──
     speed = state.car_vel.norm(dim=-1, keepdim=True)  # (E, 4, 1)
@@ -115,6 +129,32 @@ def apply_car_controls(state, actions, dt=DT):
         CAR_MAX_SPEED / speed_limited,
         torch.ones_like(speed_limited),
     )
+
+    # ── Surface orientation alignment ──
+    # When on surface, gradually align car_up toward surface_normal
+    if on_ground.any():
+        target_up = state.car_surface_normal  # (E, A, 3)
+        current_up = state.car_up             # (E, A, 3)
+        # Lerp toward target (blend=0.15 per tick at 120Hz)
+        blended_up = current_up + 0.15 * (target_up - current_up)
+        blended_up = safe_normalize(blended_up)
+        # Compute correction quaternion from current_up → blended_up
+        # Using axis-angle: axis = cross(current, target), angle = acos(dot)
+        dot = (current_up * blended_up).sum(dim=-1).clamp(-1.0, 1.0)  # (E, A)
+        axis = torch.cross(current_up, blended_up, dim=-1)  # (E, A, 3)
+        axis = safe_normalize(axis)
+        angle = torch.acos(dot)  # (E, A)
+        # Only apply on ground with non-trivial correction
+        needs_correction = on_ground & (angle > 0.001)
+        if needs_correction.any():
+            correction_quat = quat_from_axis_angle(axis, angle)
+            corrected = quat_multiply(correction_quat, state.car_quat)
+            corrected = quat_normalize(corrected)
+            state.car_quat = torch.where(
+                needs_correction.unsqueeze(-1),
+                corrected,
+                state.car_quat,
+            )
 
     # ── Zero out demoed car physics ──
     demoed = state.car_is_demoed > 0.5
@@ -131,11 +171,10 @@ def _apply_jump_flip(state, jump_input, pitch_in, yaw_in, dt):
     jump_pressed = jump_input > 0.5
     alive = state.car_is_demoed < 0.5
 
-    # ── First jump: launch off ground ──
+    # ── First jump: launch along surface normal ──
     can_first_jump = on_ground & jump_pressed & (state.car_has_jumped < 0.5) & alive
     if can_first_jump.any():
-        up = state.car_up  # (E, 4, 3)
-        impulse = up * JUMP_IMPULSE  # (E, 4, 3)
+        impulse = state.car_surface_normal * JUMP_IMPULSE  # (E, A, 3)
         state.car_vel += impulse * can_first_jump.unsqueeze(-1).float()
         state.car_on_ground[can_first_jump] = 0.0
         state.car_has_jumped[can_first_jump] = 1.0
@@ -151,8 +190,8 @@ def _apply_jump_flip(state, jump_input, pitch_in, yaw_in, dt):
         alive
     )
     if holding_jump.any():
-        up = state.car_up
-        state.car_vel += (up * JUMP_HOLD_FORCE * dt * holding_jump.unsqueeze(-1).float())
+        # Hold force along surface normal (or car_up if launched from surface)
+        state.car_vel += (state.car_surface_normal * JUMP_HOLD_FORCE * dt * holding_jump.unsqueeze(-1).float())
 
     # Release jump button → end jump hold
     released = (~jump_pressed) & (state.car_is_jumping > 0.5)

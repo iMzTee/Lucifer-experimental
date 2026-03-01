@@ -3,16 +3,16 @@
 Same interface as vectorized_collector.py but everything stays on GPU.
 No CPU↔GPU transfers in the hot loop — only at the end when returning
 experience to the PPO learner.
+
+Supports variable n_agents (1v0, 1v1, 2v2) via STAGE_CONFIG.
 """
 
 import torch
 import time
-import json
-import os
 from .environment import GPUEnvironment
 from .rewards import GPURewards
 from .observations import build_obs_batch
-from .constants import STAGE_CONFIG
+from .constants import STAGE_CONFIG, get_agent_layout
 
 
 class WelfordRunningStatGPU:
@@ -45,33 +45,30 @@ class WelfordRunningStatGPU:
 
 
 class GPUCollector:
-    """Drop-in replacement for VectorizedCollector. Same interface.
+    """Drop-in replacement for VectorizedCollector.
 
-    Everything stays on GPU:
-    - Physics simulation (GPUEnvironment)
-    - Reward computation (GPURewards)
-    - Observation building (build_obs_batch)
-    - Policy inference
-    - Experience buffer
-
-    Only moves to CPU at the very end when returning final experience tuple.
+    Supports variable n_agents per stage. Full re-init on stage change
+    when n_agents or n_envs changes.
     """
 
     def __init__(self, n_envs, device='cuda', standardize_obs=True, stage=0):
-        self.n_envs = n_envs
         self.device = device
-        self.n_agents = 4  # 2v2
-        self.total_agents = n_envs * 4
         self.obs_size = 127
-        self.act_size = 8  # MultiDiscrete(3,3,3,3,3,2,2,2)
-
+        self.act_size = 8  # MultiDiscrete(5,5,5,5,5,2,2,2)
         self.policy = None
         self.cumulative_timesteps = 0
         self.standardize_obs = standardize_obs
-
         self._stage = stage
+
+        # Get config for stage
+        cfg = STAGE_CONFIG.get(stage, STAGE_CONFIG[0])
+        self.n_envs = n_envs
+        self.n_agents = cfg.get("n_agents", 4)
+        self.layout = get_agent_layout(self.n_agents)
+        self.total_agents = n_envs * self.n_agents
+
         self.env = GPUEnvironment(n_envs, device, stage=stage)
-        self.rewards = GPURewards(n_envs, device)
+        self.rewards = GPURewards(n_envs, device, n_agents=self.n_agents, layout=self.layout)
 
         # Obs normalization
         if standardize_obs:
@@ -81,9 +78,10 @@ class GPUCollector:
         self._stats_step_counter = 0
         self._steps_per_stats_increment = 5
 
-        # Previous actions (on GPU)
-        self._prev_actions = torch.zeros(n_envs, 4, 8, device=device)
-        self._controls = torch.zeros(n_envs, 4, 8, device=device)
+        # Previous actions and controls (on GPU)
+        A = self.n_agents
+        self._prev_actions = torch.zeros(n_envs, A, 8, device=device)
+        self._controls = torch.zeros(n_envs, A, 8, device=device)
 
         # Current observation (on GPU)
         self._current_obs = torch.zeros(self.total_agents, self.obs_size, device=device)
@@ -97,7 +95,7 @@ class GPUCollector:
         if standardize_obs:
             self.obs_stats.increment(self._current_obs, self.total_agents)
 
-        print(f"[GPUCollector] Ready: {n_envs} envs x 4 agents = {self.total_agents} "
+        print(f"[GPUCollector] Ready: {n_envs} envs x {A} agents = {self.total_agents} "
               f"agents/step, obs_size={self.obs_size}, stage={stage}, device={device}")
 
     @property
@@ -107,9 +105,50 @@ class GPUCollector:
         return (self.obs_size, self.act_size, 1)
 
     def set_stage(self, stage):
-        """Update curriculum stage."""
-        self._stage = stage
-        self.env.set_stage(stage)
+        """Update curriculum stage. Full re-init if n_agents or n_envs changes."""
+        cfg = STAGE_CONFIG.get(stage, STAGE_CONFIG[0])
+        new_n_agents = cfg.get("n_agents", 4)
+        new_n_envs = cfg.get("n_envs", self.n_envs)
+
+        if new_n_agents != self.n_agents or new_n_envs != self.n_envs:
+            # Full re-init needed
+            old_policy = self.policy
+            old_obs_stats = self.obs_stats
+            old_cumul = self.cumulative_timesteps
+
+            self._stage = stage
+            self.n_envs = new_n_envs
+            self.n_agents = new_n_agents
+            self.layout = get_agent_layout(new_n_agents)
+            self.total_agents = new_n_envs * new_n_agents
+
+            self.env = GPUEnvironment(new_n_envs, self.device, stage=stage)
+            self.rewards = GPURewards(new_n_envs, self.device,
+                                       n_agents=new_n_agents, layout=self.layout)
+
+            A = new_n_agents
+            self._prev_actions = torch.zeros(new_n_envs, A, 8, device=self.device)
+            self._controls = torch.zeros(new_n_envs, A, 8, device=self.device)
+            self._current_obs = torch.zeros(self.total_agents, self.obs_size, device=self.device)
+
+            self.env.reset_all()
+            self._current_obs = build_obs_batch(self.env.state, self._prev_actions)
+            self.rewards.reset_envs(
+                torch.ones(new_n_envs, dtype=torch.bool, device=self.device), self.env.state)
+
+            # Preserve policy and obs stats
+            self.policy = old_policy
+            self.obs_stats = old_obs_stats
+            self.cumulative_timesteps = old_cumul
+
+            if self.standardize_obs and self.obs_stats is not None:
+                self.obs_stats.increment(self._current_obs, self.total_agents)
+
+            print(f"[GPUCollector] Re-init: {new_n_envs} envs x {A} agents = "
+                  f"{self.total_agents} agents/step, stage={stage}")
+        else:
+            self._stage = stage
+            self.env.set_stage(stage)
 
     def _normalize_obs(self, obs):
         """Normalize obs using running stats. obs: (N, 127) GPU tensor."""
@@ -121,16 +160,15 @@ class GPUCollector:
         """Collect at least n timesteps across all envs.
 
         Returns: (exp_tuple, metrics_list, steps_collected, elapsed_time)
-        where exp_tuple = (states, actions, log_probs, rewards, next_states, dones, truncated)
-        All returned as numpy arrays on CPU (compatible with existing PPO learner).
         """
         assert self.policy is not None, "Set .policy before calling collect_timesteps()"
         t0 = time.time()
 
         n_total = self.total_agents
+        A = self.n_agents
         n_rounds = (n + n_total - 1) // n_total
 
-        # Pre-allocate GPU buffers for experience
+        # Pre-allocate GPU buffers
         max_steps = n_rounds * n_total
         all_states = torch.empty(max_steps, self.obs_size, device=self.device)
         all_actions = torch.empty(max_steps, self.act_size, device=self.device)
@@ -144,71 +182,65 @@ class GPUCollector:
         steps_collected = 0
 
         while steps_collected < n:
-            # ── 1. Normalize current obs ──
+            # 1. Normalize current obs
             obs_norm = self._normalize_obs(self._current_obs)
 
-            # ── 2. Policy inference (on GPU) ──
+            # 2. Policy inference
             with torch.no_grad():
                 actions_t, log_probs_t = self.policy.get_action(obs_norm)
 
-            # Save pre-step states
             pre_states = obs_norm
 
-            # ── 3. Parse discrete actions to continuous controls ──
-            # actions_t: (E*4, 8) integer tensor from MultiDiscrete
-            # Convert: first 5 dims subtract 1 to get [-1, 0, 1], last 3 are {0, 1}
+            # 3. Parse discrete actions to continuous controls
+            # actions_t: (E*A, 8) from MultiDiscrete(5,5,5,5,5,2,2,2)
+            # {0,1,2,3,4} → {-1,-0.5,0,0.5,1} for first 5; {0,1} for last 3
             actions_float = actions_t.float()
-            actions_reshaped = actions_float.reshape(self.n_envs, 4, 8)
-            self._controls[:, :, :5] = actions_reshaped[:, :, :5] - 1.0
+            actions_reshaped = actions_float.reshape(self.n_envs, A, 8)
+            self._controls[:, :, :5] = actions_reshaped[:, :, :5] * 0.5 - 1.0
             self._controls[:, :, 5:] = actions_reshaped[:, :, 5:]
             self._prev_actions.copy_(self._controls)
 
-            # ── 4. Step environment ──
+            # 4. Step environment
             terminals = self.env.step(self._controls)
 
-            # ── 5. Compute rewards ──
-            rewards_batch = self.rewards.compute(self.env.state, self._stage)  # (E, 4)
+            # 5. Compute rewards
+            rewards_batch = self.rewards.compute(self.env.state, self._stage)  # (E, A)
 
-            # ── 6. Build next observations ──
+            # 6. Build next observations
             next_obs = build_obs_batch(self.env.state, self._prev_actions)
 
-            # ── 7. Update obs stats ──
+            # 7. Update obs stats
             self._stats_step_counter += 1
             if (self.standardize_obs and
                     self._stats_step_counter >= self._steps_per_stats_increment):
                 self.obs_stats.increment(next_obs, n_total)
                 self._stats_step_counter = 0
 
-            # ── 8. Normalize next obs ──
+            # 8. Normalize next obs
             next_norm = self._normalize_obs(next_obs)
 
-            # ── 9. Record experience ──
+            # 9. Record experience
             end_idx = write_idx + n_total
             all_states[write_idx:end_idx] = pre_states
             all_actions[write_idx:end_idx] = actions_float
             all_log_probs[write_idx:end_idx] = log_probs_t
             all_rewards[write_idx:end_idx] = rewards_batch.reshape(-1)
             all_next_states[write_idx:end_idx] = next_norm
-            dones_expanded = terminals.unsqueeze(1).expand(-1, 4).reshape(-1).float()
+            dones_expanded = terminals.unsqueeze(1).expand(-1, A).reshape(-1).float()
             all_dones[write_idx:end_idx] = dones_expanded
 
             write_idx = end_idx
             steps_collected += n_total
 
-            # ── 10. Update current obs + reset done envs ──
+            # 10. Update current obs + reset done envs
             self._current_obs = next_obs
 
             if terminals.any():
-                # Reset done envs
                 self.env.reset_done_envs(terminals)
-                # Reset rewards state for done envs
                 self.rewards.reset_envs(terminals, self.env.state)
-                # Rebuild obs for reset envs
                 new_obs = build_obs_batch(self.env.state, self._prev_actions)
-                # Only update obs for reset envs
-                reset_agents = terminals.unsqueeze(1).expand(-1, 4).reshape(-1)
+                reset_agents = terminals.unsqueeze(1).expand(-1, A).reshape(-1)
                 self._current_obs[reset_agents] = new_obs[reset_agents]
-                # Zero prev_actions for reset envs
                 self._prev_actions[terminals] = 0.0
 
                 if self.standardize_obs:
@@ -224,7 +256,7 @@ class GPUCollector:
         all_dones = all_dones[:actual]
         all_truncated = all_truncated[:actual]
 
-        # Mark last round non-done transitions as truncated (for GAE)
+        # Mark last round non-done as truncated (for GAE)
         last_round_start = actual - n_total
         if last_round_start >= 0:
             last_dones = all_dones[last_round_start:actual].reshape(self.n_envs, self.n_agents)
@@ -234,7 +266,6 @@ class GPUCollector:
         self.cumulative_timesteps += actual
         elapsed = time.time() - t0
 
-        # ── Return GPU tensors directly (no CPU transfer) ──
         exp = (
             all_states,
             all_actions,
@@ -247,7 +278,7 @@ class GPUCollector:
 
         return exp, [], actual, elapsed
 
-    # Cleanup methods (no-ops — no child processes)
+    # Cleanup methods (no-ops)
     def stop(self): pass
     def terminate(self): pass
     def shutdown(self): pass

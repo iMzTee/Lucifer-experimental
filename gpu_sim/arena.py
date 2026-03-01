@@ -87,60 +87,112 @@ def arena_collide_ball(state):
 
 
 def arena_collide_cars(state):
-    """Clamp car positions to arena bounds. Simpler than ball — no goal entry.
+    """Clamp car positions to arena bounds with multi-surface detection.
 
-    Cars can't enter goals. Also handles ground detection.
+    Cars can drive on floor, walls, and ceiling. Surface detection sets
+    car_on_ground and car_surface_normal for surface-relative physics.
     """
-    pos = state.car_pos   # (E, 4, 3)
-    vel = state.car_vel   # (E, 4, 3)
-    R = CAR_EFFECTIVE_RADIUS * 0.5  # cars are flatter
-    alive = (state.car_is_demoed < 0.5)
+    pos = state.car_pos   # (E, A, 3)
+    vel = state.car_vel   # (E, A, 3)
+    alive = (state.car_is_demoed < 0.5)  # (E, A)
 
-    # ── Floor (ground detection) ──
-    ground_height = 17.0  # car resting height
-    below_ground = pos[:, :, 2] < ground_height
-    on_floor = below_ground & alive
+    # Surface contact thresholds
+    WALL_MARGIN = 50.0    # distance from wall to detect contact
+    FLOOR_HEIGHT = 17.0   # car resting height on floor
+    CEIL_MARGIN = 30.0    # distance from ceiling
+    SURFACE_TOL = 10.0    # tolerance for "near surface" detection
 
-    pos[:, :, 2] = torch.where(on_floor, torch.tensor(ground_height, device=pos.device), pos[:, :, 2])
-    vel[:, :, 2] = torch.where(on_floor & (vel[:, :, 2] < 0), torch.zeros_like(vel[:, :, 2]), vel[:, :, 2])
+    # ── Clamp positions to arena bounds ──
+    # Floor
+    floor_hit = pos[:, :, 2] < FLOOR_HEIGHT
+    pos[:, :, 2] = torch.where(floor_hit & alive, torch.tensor(FLOOR_HEIGHT, device=pos.device), pos[:, :, 2])
+    vel[:, :, 2] = torch.where(floor_hit & alive & (vel[:, :, 2] < 0), torch.zeros_like(vel[:, :, 2]), vel[:, :, 2])
 
-    # Set on_ground flag
-    near_ground = (pos[:, :, 2] < ground_height + 5.0) & alive
-    state.car_on_ground = near_ground.float()
+    # Ceiling
+    ceil_limit = ARENA_HEIGHT - CEIL_MARGIN
+    ceil_hit = pos[:, :, 2] > ceil_limit
+    pos[:, :, 2] = torch.where(ceil_hit & alive, torch.tensor(ceil_limit, device=pos.device), pos[:, :, 2])
+    vel[:, :, 2] = torch.where(ceil_hit & alive & (vel[:, :, 2] > 0), torch.zeros_like(vel[:, :, 2]), vel[:, :, 2])
 
-    # Reset jump state when landing
-    landing = near_ground & (state.car_has_jumped > 0.5)
+    # Right wall (+X)
+    right_limit = ARENA_HALF_X - WALL_MARGIN
+    right_hit = pos[:, :, 0] > right_limit
+    pos[:, :, 0] = torch.where(right_hit & alive, torch.tensor(right_limit, device=pos.device), pos[:, :, 0])
+    vel[:, :, 0] = torch.where(right_hit & alive & (vel[:, :, 0] > 0), torch.zeros_like(vel[:, :, 0]), vel[:, :, 0])
+
+    # Left wall (-X)
+    left_limit = -(ARENA_HALF_X - WALL_MARGIN)
+    left_hit = pos[:, :, 0] < left_limit
+    pos[:, :, 0] = torch.where(left_hit & alive, torch.tensor(left_limit, device=pos.device), pos[:, :, 0])
+    vel[:, :, 0] = torch.where(left_hit & alive & (vel[:, :, 0] < 0), torch.zeros_like(vel[:, :, 0]), vel[:, :, 0])
+
+    # Orange back wall (+Y)
+    orange_limit = ARENA_HALF_Y - WALL_MARGIN
+    orange_hit = pos[:, :, 1] > orange_limit
+    pos[:, :, 1] = torch.where(orange_hit & alive, torch.tensor(orange_limit, device=pos.device), pos[:, :, 1])
+    vel[:, :, 1] = torch.where(orange_hit & alive & (vel[:, :, 1] > 0), torch.zeros_like(vel[:, :, 1]), vel[:, :, 1])
+
+    # Blue back wall (-Y)
+    blue_limit = -(ARENA_HALF_Y - WALL_MARGIN)
+    blue_hit = pos[:, :, 1] < blue_limit
+    pos[:, :, 1] = torch.where(blue_hit & alive, torch.tensor(blue_limit, device=pos.device), pos[:, :, 1])
+    vel[:, :, 1] = torch.where(blue_hit & alive & (vel[:, :, 1] < 0), torch.zeros_like(vel[:, :, 1]), vel[:, :, 1])
+
+    # ── Multi-surface detection ──
+    # Compute distance to each surface (6 surfaces)
+    # Distances are positive = inside arena, smaller = closer to surface
+    dist_floor   = pos[:, :, 2] - FLOOR_HEIGHT                # distance above floor
+    dist_ceiling = ceil_limit - pos[:, :, 2]                   # distance below ceiling
+    dist_right   = right_limit - pos[:, :, 0]                  # distance from right wall
+    dist_left    = pos[:, :, 0] - left_limit                   # distance from left wall
+    dist_orange  = orange_limit - pos[:, :, 1]                 # distance from orange wall
+    dist_blue    = pos[:, :, 1] - blue_limit                   # distance from blue wall
+
+    # Stack distances: (E, A, 6)
+    dists = torch.stack([dist_floor, dist_ceiling, dist_right, dist_left, dist_orange, dist_blue], dim=-1)
+
+    # Surface normals: inward-pointing (toward arena center)
+    # floor=(0,0,1), ceiling=(0,0,-1), right=(-1,0,0), left=(1,0,0), orange=(0,-1,0), blue=(0,1,0)
+    surface_normals = torch.tensor([
+        [ 0.0,  0.0,  1.0],  # floor
+        [ 0.0,  0.0, -1.0],  # ceiling
+        [-1.0,  0.0,  0.0],  # right wall (+X)
+        [ 1.0,  0.0,  0.0],  # left wall (-X)
+        [ 0.0, -1.0,  0.0],  # orange wall (+Y)
+        [ 0.0,  1.0,  0.0],  # blue wall (-Y)
+    ], device=pos.device)  # (6, 3)
+
+    # Find nearest surface per car
+    nearest_idx = dists.argmin(dim=-1)  # (E, A)
+    nearest_dist = dists.gather(-1, nearest_idx.unsqueeze(-1)).squeeze(-1)  # (E, A)
+
+    # Car is on a surface if within tolerance
+    on_surface = (nearest_dist < SURFACE_TOL) & alive  # (E, A)
+    state.car_on_ground = on_surface.float()
+
+    # Set surface normal for cars on surfaces
+    # Index into surface_normals using nearest_idx
+    nearest_normal = surface_normals[nearest_idx]  # (E, A, 3)
+    # Only update surface normal for cars on a surface; in-air cars keep floor default
+    state.car_surface_normal = torch.where(
+        on_surface.unsqueeze(-1),
+        nearest_normal,
+        torch.tensor([0.0, 0.0, 1.0], device=pos.device),
+    )
+
+    # ── Landing detection: reset jump state when touching any surface ──
+    was_airborne = state.car_has_jumped > 0.5
+    landing = on_surface & was_airborne
     state.car_has_jumped[landing] = 0.0
     state.car_has_flipped[landing] = 0.0
     state.car_has_flip[landing] = 1.0
     state.car_is_jumping[landing] = 0.0
     state.car_jump_timer[landing] = 0.0
 
-    # ── Ceiling ──
-    ceil_hit = pos[:, :, 2] > (ARENA_HEIGHT - 30.0)
-    pos[:, :, 2] = torch.where(ceil_hit & alive, torch.tensor(ARENA_HEIGHT - 30.0, device=pos.device), pos[:, :, 2])
-    vel[:, :, 2] = torch.where(ceil_hit & alive & (vel[:, :, 2] > 0), torch.zeros_like(vel[:, :, 2]), vel[:, :, 2])
-
-    # ── Side walls (X) ──
-    right_hit = pos[:, :, 0] > (ARENA_HALF_X - 50.0)
-    left_hit = pos[:, :, 0] < -(ARENA_HALF_X - 50.0)
-    pos[:, :, 0] = torch.where(right_hit & alive, torch.tensor(ARENA_HALF_X - 50.0, device=pos.device), pos[:, :, 0])
-    pos[:, :, 0] = torch.where(left_hit & alive, torch.tensor(-(ARENA_HALF_X - 50.0), device=pos.device), pos[:, :, 0])
-    vel[:, :, 0] = torch.where((right_hit & (vel[:, :, 0] > 0)) & alive, torch.zeros_like(vel[:, :, 0]), vel[:, :, 0])
-    vel[:, :, 0] = torch.where((left_hit & (vel[:, :, 0] < 0)) & alive, torch.zeros_like(vel[:, :, 0]), vel[:, :, 0])
-
-    # ── Back walls (Y) — cars can't enter goals ──
-    orange_hit = pos[:, :, 1] > (ARENA_HALF_Y - 50.0)
-    blue_hit = pos[:, :, 1] < -(ARENA_HALF_Y - 50.0)
-    pos[:, :, 1] = torch.where(orange_hit & alive, torch.tensor(ARENA_HALF_Y - 50.0, device=pos.device), pos[:, :, 1])
-    pos[:, :, 1] = torch.where(blue_hit & alive, torch.tensor(-(ARENA_HALF_Y - 50.0), device=pos.device), pos[:, :, 1])
-    vel[:, :, 1] = torch.where((orange_hit & (vel[:, :, 1] > 0)) & alive, torch.zeros_like(vel[:, :, 1]), vel[:, :, 1])
-    vel[:, :, 1] = torch.where((blue_hit & (vel[:, :, 1] < 0)) & alive, torch.zeros_like(vel[:, :, 1]), vel[:, :, 1])
-
-    # ── Ground friction (simplified) ──
-    on_ground = state.car_on_ground > 0.5
-    # Lateral friction: reduce sideways velocity
-    right_vec = torch.cross(state.car_up, state.car_fwd, dim=-1)  # (E, 4, 3)
-    lateral_speed = (vel * right_vec).sum(dim=-1, keepdim=True)  # (E, 4, 1)
+    # ── Surface friction (simplified) ──
+    on_ground_mask = state.car_on_ground > 0.5
+    # Lateral friction: reduce velocity perpendicular to forward and surface normal
+    right_vec = torch.cross(state.car_up, state.car_fwd, dim=-1)  # (E, A, 3)
+    lateral_speed = (vel * right_vec).sum(dim=-1, keepdim=True)  # (E, A, 1)
     friction_force = lateral_speed * right_vec * 0.3  # 30% lateral friction per tick
-    vel -= friction_force * on_ground.unsqueeze(-1).float()
+    vel -= friction_force * on_ground_mask.unsqueeze(-1).float()

@@ -1,6 +1,6 @@
-"""rewards.py — All 13 reward signals + events + team spirit on GPU.
+"""rewards.py — All reward signals + events + team spirit on GPU.
 
-Direct port of vectorized_env.py VectorizedRewards from numpy to PyTorch.
+Supports variable n_agents (1v0, 1v1, 2v2).
 Operates on TensorState directly (no data movement).
 """
 
@@ -9,18 +9,18 @@ import math
 from .constants import (
     BALL_RADIUS, BALL_MAX_SPEED, CAR_MAX_SPEED, BACK_NET_Y,
     GOAL_HEIGHT, BLUE_GOAL_BACK, ORANGE_GOAL_BACK,
-    ALLY_IDX, ENEMY0_IDX, ENEMY1_IDX,
 )
 
-# ── Reward weights per stage (same as vectorized_env.py) ──
+# ── Reward weights per stage ──
 # [R1:VelBallGoal, R2:BallGoalDist, R3:TouchQuality, R4:PlayerBallProxVel,
 #  R5:Kickoff, R6:DefensivePos, R7:BoostEff, R8:DemoAttempt,
-#  R9:AirControl, R10:FlipReset, R11:AngVel, R12:Speed, R13:BallAccel]
+#  R9:AirControl, R10:FlipReset, R11:AngVel, R12:Speed, R13:BallAccel,
+#  R14:SpeedFlip, R15:WaveDash, R16:WallDrive, R17:AirDribble]
 STAGE_WEIGHTS = {
-    0: [2.0, 1.0, 2.0, 2.0, 3.0, 0.5, 0.5, 0.0, 0.5, 0.0,  0.0,   1.0, 1.5],
-    1: [5.0, 3.0, 3.0, 1.5, 2.0, 1.5, 1.0, 0.5, 1.5, 0.0,  0.005, 0.5, 2.0],
-    2: [5.0, 3.0, 3.0, 1.0, 2.0, 1.5, 1.0, 1.0, 2.0, 5.0,  0.005, 0.3, 2.0],
-    3: [5.0, 3.0, 3.0, 0.5, 2.0, 1.5, 1.0, 1.0, 2.0, 10.0, 0.005, 0.2, 2.0],
+    0: [2.0, 1.0, 2.0, 2.0, 3.0, 0.0, 0.5, 0.0, 0.5, 0.0,  0.0,   1.0, 1.5,  3.0, 2.0, 0.0, 0.0],
+    1: [5.0, 3.0, 3.0, 1.5, 2.0, 0.5, 1.0, 0.5, 1.5, 0.0,  0.005, 0.5, 2.0,  2.0, 2.0, 1.0, 3.0],
+    2: [5.0, 3.0, 3.0, 1.0, 2.0, 1.5, 1.0, 1.0, 2.0, 5.0,  0.005, 0.3, 2.0,  1.0, 1.0, 0.5, 2.0],
+    3: [5.0, 3.0, 3.0, 0.5, 2.0, 1.5, 1.0, 1.0, 2.0, 10.0, 0.005, 0.2, 2.0,  0.5, 0.5, 0.5, 1.0],
 }
 
 EVENT_WEIGHTS = {
@@ -30,29 +30,37 @@ EVENT_WEIGHTS = {
     3: [10.0, 0.0, -7.0, 0.5, 3.0, 5.0, 8.0, 0.0],
 }
 
-TEAM_SPIRIT = {0: 0.0, 1: 0.3, 2: 0.5, 3: 0.6}
+TEAM_SPIRIT = {0: 0.0, 1: 0.0, 2: 0.3, 3: 0.6}
 
 
 class GPURewards:
-    """Computes all 13 reward signals for all envs/agents in batched PyTorch."""
+    """Computes reward signals for all envs/agents in batched PyTorch.
 
-    def __init__(self, n_envs, device='cuda'):
+    Supports n_agents = 1, 2, or 4.
+    """
+
+    def __init__(self, n_envs, device='cuda', n_agents=4, layout=None):
         self.n_envs = n_envs
-        self.n_agents = 4
+        self.n_agents = n_agents
         self.device = device
+        self.layout = layout
 
         # Event tracking: [goals, team_score, opp_score, touched, shots, saves, demos, boost]
-        self.event_last = torch.zeros(n_envs, 4, 8, device=device)
+        self.event_last = torch.zeros(n_envs, n_agents, 8, device=device)
 
         # Kickoff state
         self.is_kickoff = torch.zeros(n_envs, dtype=torch.bool, device=device)
 
         # Previous boost for R7
-        self.prev_player_boost = torch.zeros(n_envs, 4, device=device)
+        self.prev_player_boost = torch.zeros(n_envs, n_agents, device=device)
+
+        # Tracking state for new rewards
+        self.prev_on_ground = torch.ones(n_envs, n_agents, device=device)
+        self.prev_has_flipped = torch.zeros(n_envs, n_agents, device=device)
 
         # Pre-compute goal positions for broadcasting
-        self._orange_goal = ORANGE_GOAL_BACK.to(device)  # (3,)
-        self._blue_goal = BLUE_GOAL_BACK.to(device)      # (3,)
+        self._orange_goal = ORANGE_GOAL_BACK.to(device)
+        self._blue_goal = BLUE_GOAL_BACK.to(device)
 
         # Pre-allocate weight tensors
         self._stage_weights = {}
@@ -66,8 +74,8 @@ class GPURewards:
         if not mask.any():
             return
 
-        # Snapshot event state
-        is_blue = state.car_team == 0  # (E, 4)
+        A = self.n_agents
+        is_blue = state.car_team == 0  # (E, A)
 
         goals = state.match_goals[mask]
         team_score = torch.where(is_blue[mask], state.blue_score[mask].unsqueeze(1).float(),
@@ -98,61 +106,71 @@ class GPURewards:
         )
 
         self.prev_player_boost[mask] = state.car_boost[mask]
+        self.prev_on_ground[mask] = state.car_on_ground[mask]
+        self.prev_has_flipped[mask] = state.car_has_flipped[mask]
 
     def compute(self, state, stage):
         """Compute combined rewards for all envs/agents.
 
-        Returns: (E, 4) reward tensor on GPU.
+        Returns: (E, A) reward tensor on GPU.
         """
         E = self.n_envs
+        A = self.n_agents
         s = state
+        layout = self.layout
         weights = self._stage_weights.get(stage, self._stage_weights[3])
         ev_weights = self._event_weights.get(stage, self._event_weights[3])
         ts = TEAM_SPIRIT.get(stage, 0.6)
 
         # ── Precompute common values ──
         ball_e = s.ball_pos.unsqueeze(1)  # (E, 1, 3)
-        to_ball = ball_e - s.car_pos      # (E, 4, 3)
-        to_ball_dist = to_ball.norm(dim=-1)  # (E, 4)
+        to_ball = ball_e - s.car_pos      # (E, A, 3)
+        to_ball_dist = to_ball.norm(dim=-1)  # (E, A)
         to_ball_dir = to_ball / (to_ball_dist.unsqueeze(-1) + 1e-6)
 
-        player_speed = s.car_vel.norm(dim=-1)  # (E, 4)
-        is_blue = (s.car_team == 0)  # (E, 4) bool
+        player_speed = s.car_vel.norm(dim=-1)  # (E, A)
+        is_blue = (s.car_team == 0)
         is_blue_f = is_blue.float()
 
         # Goal positions per agent
         opp_goal = (is_blue_f.unsqueeze(-1) * self._orange_goal +
-                    (1 - is_blue_f).unsqueeze(-1) * self._blue_goal)  # (E, 4, 3)
+                    (1 - is_blue_f).unsqueeze(-1) * self._blue_goal)
         own_goal = (is_blue_f.unsqueeze(-1) * self._blue_goal +
                     (1 - is_blue_f).unsqueeze(-1) * self._orange_goal)
 
-        # Closest on team
-        ally_dist = to_ball_dist[:, ALLY_IDX]  # (E, 4)
-        is_closest = to_ball_dist <= ally_dist  # (E, 4)
+        # Closest on team — for 1v0, always closest; for 1v1/2v2, compare with ally
+        if A == 1:
+            is_closest = torch.ones(E, A, dtype=torch.bool, device=self.device)
+        elif A == 2:
+            # No ally in 1v1, always closest on team
+            is_closest = torch.ones(E, A, dtype=torch.bool, device=self.device)
+        else:
+            ally_idx = layout["ally_idx"]
+            ally_dist = torch.stack([to_ball_dist[:, ally_idx[i]] for i in range(A)], dim=1)
+            is_closest = to_ball_dist <= ally_dist
 
-        # Ball speed
         ball_speed = s.ball_vel.norm(dim=-1)  # (E,)
 
-        rewards = torch.zeros(E, 4, device=self.device)
+        rewards = torch.zeros(E, A, device=self.device)
 
         # ── R1: VelocityBallToGoal ──
         if weights[0] > 0:
-            pos_diff = opp_goal - ball_e  # (E, 4, 3)
+            pos_diff = opp_goal - ball_e
             norm_pd = pos_diff / (pos_diff.norm(dim=-1, keepdim=True) + 1e-6)
-            norm_bv = s.ball_vel.unsqueeze(1) / BALL_MAX_SPEED  # (E, 1, 3)
+            norm_bv = s.ball_vel.unsqueeze(1) / BALL_MAX_SPEED
             rewards += weights[0] * (norm_pd * norm_bv).sum(dim=-1)
 
         # ── R2: BallGoalDistancePotential ──
         if weights[1] > 0:
-            ball_to_opp = (ball_e - opp_goal).norm(dim=-1)  # (E, 4)
+            ball_to_opp = (ball_e - opp_goal).norm(dim=-1)
             ball_to_own = (ball_e - own_goal).norm(dim=-1)
             rewards += weights[1] * (torch.exp(-ball_to_opp / 6000.0) - torch.exp(-ball_to_own / 6000.0))
 
         # ── R3: TouchQuality ──
         if weights[2] > 0:
-            touched = s.car_ball_touched  # (E, 4)
-            ball_z = s.ball_pos[:, 2].unsqueeze(1)  # (E, 1)
-            ball_speed_e = ball_speed.unsqueeze(1)   # (E, 1)
+            touched = s.car_ball_touched
+            ball_z = s.ball_pos[:, 2].unsqueeze(1)
+            ball_speed_e = ball_speed.unsqueeze(1)
             height_term = 1.0 + torch.clamp(ball_z - 150.0, min=0).pow(1.0/3.0) / (2044.0 ** (1.0/3.0)) * 2.0
             speed_term = 0.5 + 0.5 * (ball_speed_e / 2300.0).clamp(max=2.0)
             wall_x = (torch.abs(s.ball_pos[:, 0]) > 3800.0).unsqueeze(1)
@@ -161,7 +179,7 @@ class GPURewards:
                                       torch.tensor(1.0, device=self.device))
             rewards += weights[2] * (touched * height_term * speed_term * wall_factor)
 
-        # ── R4: PlayerBallProximityVelocity (closest on team only) ──
+        # ── R4: PlayerBallProximityVelocity ──
         if weights[3] > 0:
             speed_toward_ball = (s.car_vel * to_ball_dir).sum(dim=-1) / CAR_MAX_SPEED
             speed_toward_ball = speed_toward_ball.clamp(min=0)
@@ -176,12 +194,12 @@ class GPURewards:
         else:
             self.is_kickoff = self.is_kickoff & (ball_speed < 100)
 
-        # ── R6: DefensivePositioning (support role only) ──
-        if weights[5] > 0:
+        # ── R6: DefensivePositioning (skip for 1v0, reduced for 1v1) ──
+        if weights[5] > 0 and A >= 2:
             is_support = ~is_closest
             own_goal_y = torch.where(is_blue, torch.tensor(-5120.0, device=self.device),
                                      torch.tensor(5120.0, device=self.device))
-            own_goal_3d = torch.zeros(E, 4, 3, device=self.device)
+            own_goal_3d = torch.zeros(E, A, 3, device=self.device)
             own_goal_3d[:, :, 1] = own_goal_y
 
             g2b = ball_e - own_goal_3d
@@ -202,28 +220,27 @@ class GPURewards:
                                    torch.tensor(1.0, device=self.device))
             rewards += weights[6] * (torch.sqrt(boost_gained) * pad_mult).clamp(max=0.5)
 
-        # ── R8: DemoAttempt ──
-        if weights[7] > 0:
-            opp0_pos = s.car_pos[:, ENEMY0_IDX]
-            opp1_pos = s.car_pos[:, ENEMY1_IDX]
-            to_opp0 = opp0_pos - s.car_pos
-            to_opp1 = opp1_pos - s.car_pos
-            d0 = to_opp0.norm(dim=-1)
-            d1 = to_opp1.norm(dim=-1)
-            nearest_dist = torch.min(d0, d1)
-            nearest_vec = torch.where((d0 <= d1).unsqueeze(-1), to_opp0, to_opp1)
-            nearest_dir = nearest_vec / (nearest_dist.unsqueeze(-1) + 1e-6)
-            speed_to_opp = (s.car_vel * nearest_dir).sum(dim=-1)
-            rewards += weights[7] * (
-                torch.exp(-nearest_dist / 500.0) *
-                (speed_to_opp / 2300.0).clamp(min=0) *
-                (player_speed > 1500.0).float()
-            )
+        # ── R8: DemoAttempt (skip for 1v0) ──
+        if weights[7] > 0 and A >= 2:
+            enemy0_idx = layout["enemy0_idx"]
+            for i in range(A):
+                e0 = enemy0_idx[i]
+                if e0 < 0:
+                    continue
+                to_opp = s.car_pos[:, e0] - s.car_pos[:, i]
+                d = to_opp.norm(dim=-1)
+                opp_dir = to_opp / (d.unsqueeze(-1) + 1e-6)
+                speed_to_opp = (s.car_vel[:, i] * opp_dir).sum(dim=-1)
+                rewards[:, i] += weights[7] * (
+                    torch.exp(-d / 500.0) *
+                    (speed_to_opp / 2300.0).clamp(min=0) *
+                    (player_speed[:, i] > 1500.0).float()
+                )
 
-        # ── R9: AirControl = max(dribble, aerial) ──
+        # ── R9: AirControl ──
         if weights[8] > 0:
-            bz = s.ball_pos[:, 2].unsqueeze(1)  # (E, 1)
-            cz = s.car_pos[:, :, 2]              # (E, 4)
+            bz = s.ball_pos[:, 2].unsqueeze(1)
+            cz = s.car_pos[:, :, 2]
             ball_above = bz > (cz + 60.0)
 
             xy_diff = s.ball_pos[:, :2].unsqueeze(1) - s.car_pos[:, :, :2]
@@ -232,7 +249,6 @@ class GPURewards:
             prox = (1.0 - xy_dist / 180.0).clamp(0, 1)
             ht = ((bz - cz - 60.0) / 250.0).clamp(0, 1)
 
-            on_ground_f = (s.car_on_ground > 0.5).float()
             dribble = torch.where(
                 ball_above & close_overhead & (s.car_on_ground > 0.5),
                 prox * (0.3 + 0.7 * ht),
@@ -270,10 +286,54 @@ class GPURewards:
             accel_norm = ball_accel / BALL_MAX_SPEED
             rewards += weights[12] * (accel_norm.unsqueeze(1) * s.car_ball_touched)
 
+        # ── R14: SpeedFlipReward ──
+        # Detect: has_flipped & high forward speed & near ground & in air
+        if weights[13] > 0:
+            has_flipped = s.car_has_flipped > 0.5
+            fwd_speed = (s.car_vel * s.car_fwd).sum(dim=-1)  # (E, A)
+            near_ground = s.car_pos[:, :, 2] < 100.0
+            in_air = s.car_on_ground < 0.5
+            speed_bonus = (fwd_speed / CAR_MAX_SPEED).clamp(min=0)
+            rewards += weights[13] * (
+                has_flipped.float() * in_air.float() * near_ground.float() *
+                (fwd_speed > 1000.0).float() * speed_bonus
+            )
+
+        # ── R15: WaveDashReward ──
+        # Detect: just landed & was flipping last frame & high speed
+        if weights[14] > 0:
+            just_landed = (s.car_on_ground > 0.5) & (self.prev_on_ground < 0.5)
+            was_flipping = self.prev_has_flipped > 0.5
+            current_speed = s.car_vel.norm(dim=-1)
+            speed_bonus = (current_speed / CAR_MAX_SPEED).clamp(min=0)
+            rewards += weights[14] * (
+                just_landed.float() * was_flipping.float() *
+                (current_speed > 800.0).float() * speed_bonus
+            )
+
+        # ── R16: WallDriveReward ──
+        # Detect: on ground & surface normal is not floor (abs(z) < 0.5)
+        if weights[15] > 0:
+            on_wall = (s.car_on_ground > 0.5) & (torch.abs(s.car_surface_normal[:, :, 2]) < 0.5)
+            fwd_speed = (s.car_vel * s.car_fwd).sum(dim=-1)
+            wall_speed = (torch.abs(fwd_speed) / CAR_MAX_SPEED).clamp(min=0)
+            rewards += weights[15] * (on_wall.float() * wall_speed)
+
+        # ── R17: AirDribbleReward ──
+        # Detect: in air & close to ball & ball high & touched
+        if weights[16] > 0:
+            in_air = s.car_on_ground < 0.5
+            ball_high = s.ball_pos[:, 2].unsqueeze(1) > 300.0  # (E, 1)
+            close = to_ball_dist < 300.0  # (E, A)
+            touched = s.car_ball_touched > 0.5
+            rewards += weights[16] * (
+                in_air.float() * ball_high.float() * close.float() * touched.float() * 2.0
+            )
+
         # ── Event Reward ──
-        current_ev = torch.zeros(E, 4, 8, device=self.device)
+        current_ev = torch.zeros(E, A, 8, device=self.device)
         current_ev[:, :, 0] = s.match_goals
-        for j in range(4):
+        for j in range(A):
             blue_mask = (s.car_team[:, j] == 0).float()
             current_ev[:, j, 1] = blue_mask * s.blue_score.float() + (1 - blue_mask) * s.orange_score.float()
             current_ev[:, j, 2] = blue_mask * s.orange_score.float() + (1 - blue_mask) * s.blue_score.float()
@@ -287,8 +347,8 @@ class GPURewards:
         rewards += (diff * ev_weights.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
         self.event_last.copy_(current_ev)
 
-        # ── Team Spirit blending ──
-        if ts > 0:
+        # ── Team Spirit blending (only for 2v2) ──
+        if ts > 0 and A == 4:
             blue_mean = (rewards[:, 0] + rewards[:, 1]) * 0.5
             orange_mean = (rewards[:, 2] + rewards[:, 3]) * 0.5
             team_mean = torch.stack([blue_mean, blue_mean, orange_mean, orange_mean], dim=1)
@@ -296,5 +356,7 @@ class GPURewards:
 
         # ── Update tracking state ──
         self.prev_player_boost.copy_(s.car_boost)
+        self.prev_on_ground.copy_(s.car_on_ground)
+        self.prev_has_flipped.copy_(s.car_has_flipped)
 
         return rewards
