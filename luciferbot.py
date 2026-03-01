@@ -186,7 +186,7 @@ class GPULearner:
         # Visualization sender (zero overhead when disabled)
         vis_enabled = os.environ.get("VIS", "0") == "1"
         if vis_enabled:
-            n_envs = 500  # cap for smooth vis (more steps per iteration)
+            n_envs = 3000  # cap for smooth vis (more steps per iteration)
         vis_sender = VisSender(n_envs=n_envs, enabled=vis_enabled) if vis_enabled else None
 
         stage_name = CURRICULUM_STAGE_NAMES[stage]

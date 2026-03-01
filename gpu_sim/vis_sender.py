@@ -32,7 +32,7 @@ class VisSender:
 
     STALE_TIMEOUT = 0.5  # seconds before switching to zero-velocity hold
 
-    def __init__(self, n_envs=1, enabled=False, switch_interval=5.0, port=9273):
+    def __init__(self, n_envs=1, enabled=False, switch_interval=10.0, port=9273):
         self.n_envs = n_envs
         self.enabled = enabled
         self.port = port
