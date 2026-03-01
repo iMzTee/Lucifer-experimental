@@ -31,10 +31,11 @@ class GPUEnvironment:
     Supports 1v0 (n_agents=1), 1v1 (n_agents=2), 2v2 (n_agents=4).
     """
 
-    def __init__(self, n_envs, device='cuda', stage=0):
+    def __init__(self, n_envs, device='cuda', stage=0, vis_sender=None):
         self.n_envs = n_envs
         self.device = device
         self.stage = stage
+        self._vis_sender = vis_sender
 
         cfg = STAGE_CONFIG.get(stage, STAGE_CONFIG[0])
         self.tick_skip = cfg["tick_skip"]
@@ -882,8 +883,10 @@ class GPUEnvironment:
         self.state.prev_ball_speed = self.state.ball_vel.norm(dim=-1)
         self.state.car_ball_touched[:] = 0.0
 
-        for _ in range(self.tick_skip):
+        for i in range(self.tick_skip):
             self._physics_tick(actions)
+            if self._vis_sender is not None and i == self.tick_skip // 2 - 1:
+                self._vis_sender.send(self.state)
 
         self.state.step_count += 1
         return self._check_terminals()
