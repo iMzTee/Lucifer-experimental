@@ -19,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from gpu_sim.collector import GPUCollector
 from gpu_sim.constants import STAGE_CONFIG
 from gpu_sim.ppo import PPOLearner, ExperienceBuffer
+from gpu_sim.vis_sender import VisSender
 
 
 # ─── Curriculum state persistence ───
@@ -189,10 +190,17 @@ class GPULearner:
         print(f"  Steps per iteration: {ts_per_iteration:,}")
         print(f"{'='*60}")
 
+        # Visualization sender (zero overhead when disabled)
+        vis_enabled = os.environ.get("VIS", "0") == "1"
+        vis_sender = VisSender(env_idx=0, enabled=vis_enabled) if vis_enabled else None
+        if vis_enabled:
+            print("[*] Visualization enabled — sending env 0 to RocketSimVis (UDP 127.0.0.1:9273)")
+            print("[*] Start viewer: cd rocketsimvis && python main.py")
+
         # GPU Collector
         self.agent = GPUCollector(
             n_envs=n_envs, device=self.device,
-            standardize_obs=True, stage=stage)
+            standardize_obs=True, stage=stage, vis_sender=vis_sender)
 
         # PPO Learner
         self.ppo_learner = PPOLearner(

@@ -51,7 +51,7 @@ class GPUCollector:
     when n_agents or n_envs changes.
     """
 
-    def __init__(self, n_envs, device='cuda', standardize_obs=True, stage=0):
+    def __init__(self, n_envs, device='cuda', standardize_obs=True, stage=0, vis_sender=None):
         self.device = device
         self.obs_size = 127
         self.act_size = 8  # MultiDiscrete(5,5,5,5,5,2,2,2)
@@ -59,6 +59,7 @@ class GPUCollector:
         self.cumulative_timesteps = 0
         self.standardize_obs = standardize_obs
         self._stage = stage
+        self.vis_sender = vis_sender
 
         # Get config for stage
         cfg = STAGE_CONFIG.get(stage, STAGE_CONFIG[0])
@@ -202,6 +203,10 @@ class GPUCollector:
 
             # 4. Step environment
             terminals = self.env.step(self._controls)
+
+            # 4b. Send state to visualizer (no-op when vis_sender is None)
+            if self.vis_sender is not None:
+                self.vis_sender.send(self.env.state)
 
             # 5. Compute rewards
             rewards_batch = self.rewards.compute(self.env.state, self._stage)  # (E, A)
