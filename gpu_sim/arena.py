@@ -11,6 +11,26 @@ from .constants import (
     GOAL_HALF_WIDTH, GOAL_HEIGHT, GOAL_DEPTH, BACK_NET_Y,
 )
 
+# ── Cached constants (created once on first use, avoid per-tick GPU alloc) ──
+_surface_normals = None
+_default_normal = None
+
+
+def _get_cached_tensors(device):
+    """Lazily create and cache constant tensors on the correct device."""
+    global _surface_normals, _default_normal
+    if _surface_normals is None or _surface_normals.device != device:
+        _surface_normals = torch.tensor([
+            [ 0.0,  0.0,  1.0],  # floor
+            [ 0.0,  0.0, -1.0],  # ceiling
+            [-1.0,  0.0,  0.0],  # right wall (+X)
+            [ 1.0,  0.0,  0.0],  # left wall (-X)
+            [ 0.0, -1.0,  0.0],  # orange wall (+Y)
+            [ 0.0,  1.0,  0.0],  # blue wall (-Y)
+        ], device=device)
+        _default_normal = torch.tensor([0.0, 0.0, 1.0], device=device)
+    return _surface_normals, _default_normal
+
 
 def arena_collide_ball(state):
     """Clamp ball position to arena bounds, reflect velocity on contact.
@@ -23,66 +43,59 @@ def arena_collide_ball(state):
     R = BALL_RADIUS
     rest = BALL_RESTITUTION
 
+    # Pre-compute constant clamp values (Python floats — no GPU alloc)
+    ball_floor = R
+    ball_ceil = ARENA_HEIGHT - R
+    ball_right = ARENA_HALF_X - R
+    ball_left = -(ARENA_HALF_X - R)
+    ball_orange = ARENA_HALF_Y - R
+    ball_blue = -(ARENA_HALF_Y - R)
+    net_orange = BACK_NET_Y - R
+    net_blue = -(BACK_NET_Y - R)
+
     # ── Floor ──
-    floor_pen = R - pos[:, 2]
-    floor_hit = floor_pen > 0
-    pos[:, 2] = torch.where(floor_hit, torch.tensor(R, device=pos.device), pos[:, 2])
+    floor_hit = pos[:, 2] < ball_floor
+    pos[:, 2] = torch.where(floor_hit, ball_floor, pos[:, 2])
     vel[:, 2] = torch.where(floor_hit, torch.abs(vel[:, 2]) * rest, vel[:, 2])
 
-    # Ball spin on floor (simplified: reduce horizontal vel slightly, add spin)
-    # Omitted for now — minimal impact on training
-
     # ── Ceiling ──
-    ceil_pen = pos[:, 2] + R - ARENA_HEIGHT
-    ceil_hit = ceil_pen > 0
-    pos[:, 2] = torch.where(ceil_hit, torch.tensor(ARENA_HEIGHT - R, device=pos.device), pos[:, 2])
+    ceil_hit = pos[:, 2] > ball_ceil
+    pos[:, 2] = torch.where(ceil_hit, ball_ceil, pos[:, 2])
     vel[:, 2] = torch.where(ceil_hit, -torch.abs(vel[:, 2]) * rest, vel[:, 2])
 
     # ── Side walls (X) ──
-    # Right wall (+X)
-    right_pen = pos[:, 0] + R - ARENA_HALF_X
-    right_hit = right_pen > 0
-    pos[:, 0] = torch.where(right_hit, torch.tensor(ARENA_HALF_X - R, device=pos.device), pos[:, 0])
+    right_hit = pos[:, 0] > ball_right
+    pos[:, 0] = torch.where(right_hit, ball_right, pos[:, 0])
     vel[:, 0] = torch.where(right_hit, -torch.abs(vel[:, 0]) * rest, vel[:, 0])
 
-    # Left wall (-X)
-    left_pen = -(pos[:, 0] - R) - ARENA_HALF_X
-    left_hit = left_pen > 0
-    pos[:, 0] = torch.where(left_hit, torch.tensor(-ARENA_HALF_X + R, device=pos.device), pos[:, 0])
+    left_hit = pos[:, 0] < ball_left
+    pos[:, 0] = torch.where(left_hit, ball_left, pos[:, 0])
     vel[:, 0] = torch.where(left_hit, torch.abs(vel[:, 0]) * rest, vel[:, 0])
 
     # ── Back walls (Y) with goal openings ──
-    # Ball is in the goal opening if |x| < GOAL_HALF_WIDTH and z < GOAL_HEIGHT
     in_goal_x = torch.abs(pos[:, 0]) < GOAL_HALF_WIDTH
     in_goal_z = pos[:, 2] < GOAL_HEIGHT
+    in_goal = in_goal_x & in_goal_z
 
     # Orange end (+Y)
-    orange_pen = pos[:, 1] + R - ARENA_HALF_Y
-    orange_hit = orange_pen > 0
-    in_goal = in_goal_x & in_goal_z
-    # If in goal opening: don't bounce, let ball enter goal
-    # If not in goal opening: bounce off back wall
-    bounce_orange = orange_hit & ~in_goal
-    pos[:, 1] = torch.where(bounce_orange, torch.tensor(ARENA_HALF_Y - R, device=pos.device), pos[:, 1])
+    bounce_orange = (pos[:, 1] > ball_orange) & ~in_goal
+    pos[:, 1] = torch.where(bounce_orange, ball_orange, pos[:, 1])
     vel[:, 1] = torch.where(bounce_orange, -torch.abs(vel[:, 1]) * rest, vel[:, 1])
 
     # Blue end (-Y)
-    blue_pen = -(pos[:, 1] - R) - ARENA_HALF_Y
-    blue_hit = blue_pen > 0
-    bounce_blue = blue_hit & ~in_goal
-    pos[:, 1] = torch.where(bounce_blue, torch.tensor(-ARENA_HALF_Y + R, device=pos.device), pos[:, 1])
+    bounce_blue = (pos[:, 1] < ball_blue) & ~in_goal
+    pos[:, 1] = torch.where(bounce_blue, ball_blue, pos[:, 1])
     vel[:, 1] = torch.where(bounce_blue, torch.abs(vel[:, 1]) * rest, vel[:, 1])
 
     # ── Goal back net ──
-    # If ball is past goal line and inside goal opening, clamp to net
-    past_orange = pos[:, 1] > BACK_NET_Y - R
+    past_orange = pos[:, 1] > net_orange
     if past_orange.any():
-        pos[:, 1] = torch.where(past_orange, torch.tensor(BACK_NET_Y - R, device=pos.device), pos[:, 1])
+        pos[:, 1] = torch.where(past_orange, net_orange, pos[:, 1])
         vel[:, 1] = torch.where(past_orange, -torch.abs(vel[:, 1]) * 0.3, vel[:, 1])
 
-    past_blue = pos[:, 1] < -(BACK_NET_Y - R)
+    past_blue = pos[:, 1] < net_blue
     if past_blue.any():
-        pos[:, 1] = torch.where(past_blue, torch.tensor(-(BACK_NET_Y - R), device=pos.device), pos[:, 1])
+        pos[:, 1] = torch.where(past_blue, net_blue, pos[:, 1])
         vel[:, 1] = torch.where(past_blue, torch.abs(vel[:, 1]) * 0.3, vel[:, 1])
 
 
@@ -102,41 +115,43 @@ def arena_collide_cars(state):
     CEIL_MARGIN = 30.0    # distance from ceiling
     SURFACE_TOL = 10.0    # tolerance for "near surface" detection
 
+    # Pre-compute limits (Python floats — no GPU alloc)
+    ceil_limit = ARENA_HEIGHT - CEIL_MARGIN
+    right_limit = ARENA_HALF_X - WALL_MARGIN
+    left_limit = -(ARENA_HALF_X - WALL_MARGIN)
+    orange_limit = ARENA_HALF_Y - WALL_MARGIN
+    blue_limit = -(ARENA_HALF_Y - WALL_MARGIN)
+
     # ── Clamp positions to arena bounds ──
     # Floor
     floor_hit = pos[:, :, 2] < FLOOR_HEIGHT
-    pos[:, :, 2] = torch.where(floor_hit & alive, torch.tensor(FLOOR_HEIGHT, device=pos.device), pos[:, :, 2])
-    vel[:, :, 2] = torch.where(floor_hit & alive & (vel[:, :, 2] < 0), torch.zeros_like(vel[:, :, 2]), vel[:, :, 2])
+    pos[:, :, 2] = torch.where(floor_hit & alive, FLOOR_HEIGHT, pos[:, :, 2])
+    vel[:, :, 2] = torch.where(floor_hit & alive & (vel[:, :, 2] < 0), 0.0, vel[:, :, 2])
 
     # Ceiling
-    ceil_limit = ARENA_HEIGHT - CEIL_MARGIN
     ceil_hit = pos[:, :, 2] > ceil_limit
-    pos[:, :, 2] = torch.where(ceil_hit & alive, torch.tensor(ceil_limit, device=pos.device), pos[:, :, 2])
-    vel[:, :, 2] = torch.where(ceil_hit & alive & (vel[:, :, 2] > 0), torch.zeros_like(vel[:, :, 2]), vel[:, :, 2])
+    pos[:, :, 2] = torch.where(ceil_hit & alive, ceil_limit, pos[:, :, 2])
+    vel[:, :, 2] = torch.where(ceil_hit & alive & (vel[:, :, 2] > 0), 0.0, vel[:, :, 2])
 
     # Right wall (+X)
-    right_limit = ARENA_HALF_X - WALL_MARGIN
     right_hit = pos[:, :, 0] > right_limit
-    pos[:, :, 0] = torch.where(right_hit & alive, torch.tensor(right_limit, device=pos.device), pos[:, :, 0])
-    vel[:, :, 0] = torch.where(right_hit & alive & (vel[:, :, 0] > 0), torch.zeros_like(vel[:, :, 0]), vel[:, :, 0])
+    pos[:, :, 0] = torch.where(right_hit & alive, right_limit, pos[:, :, 0])
+    vel[:, :, 0] = torch.where(right_hit & alive & (vel[:, :, 0] > 0), 0.0, vel[:, :, 0])
 
     # Left wall (-X)
-    left_limit = -(ARENA_HALF_X - WALL_MARGIN)
     left_hit = pos[:, :, 0] < left_limit
-    pos[:, :, 0] = torch.where(left_hit & alive, torch.tensor(left_limit, device=pos.device), pos[:, :, 0])
-    vel[:, :, 0] = torch.where(left_hit & alive & (vel[:, :, 0] < 0), torch.zeros_like(vel[:, :, 0]), vel[:, :, 0])
+    pos[:, :, 0] = torch.where(left_hit & alive, left_limit, pos[:, :, 0])
+    vel[:, :, 0] = torch.where(left_hit & alive & (vel[:, :, 0] < 0), 0.0, vel[:, :, 0])
 
     # Orange back wall (+Y)
-    orange_limit = ARENA_HALF_Y - WALL_MARGIN
     orange_hit = pos[:, :, 1] > orange_limit
-    pos[:, :, 1] = torch.where(orange_hit & alive, torch.tensor(orange_limit, device=pos.device), pos[:, :, 1])
-    vel[:, :, 1] = torch.where(orange_hit & alive & (vel[:, :, 1] > 0), torch.zeros_like(vel[:, :, 1]), vel[:, :, 1])
+    pos[:, :, 1] = torch.where(orange_hit & alive, orange_limit, pos[:, :, 1])
+    vel[:, :, 1] = torch.where(orange_hit & alive & (vel[:, :, 1] > 0), 0.0, vel[:, :, 1])
 
     # Blue back wall (-Y)
-    blue_limit = -(ARENA_HALF_Y - WALL_MARGIN)
     blue_hit = pos[:, :, 1] < blue_limit
-    pos[:, :, 1] = torch.where(blue_hit & alive, torch.tensor(blue_limit, device=pos.device), pos[:, :, 1])
-    vel[:, :, 1] = torch.where(blue_hit & alive & (vel[:, :, 1] < 0), torch.zeros_like(vel[:, :, 1]), vel[:, :, 1])
+    pos[:, :, 1] = torch.where(blue_hit & alive, blue_limit, pos[:, :, 1])
+    vel[:, :, 1] = torch.where(blue_hit & alive & (vel[:, :, 1] < 0), 0.0, vel[:, :, 1])
 
     # ── Multi-surface detection ──
     # Compute distance to each surface (6 surfaces)
@@ -151,16 +166,8 @@ def arena_collide_cars(state):
     # Stack distances: (E, A, 6)
     dists = torch.stack([dist_floor, dist_ceiling, dist_right, dist_left, dist_orange, dist_blue], dim=-1)
 
-    # Surface normals: inward-pointing (toward arena center)
-    # floor=(0,0,1), ceiling=(0,0,-1), right=(-1,0,0), left=(1,0,0), orange=(0,-1,0), blue=(0,1,0)
-    surface_normals = torch.tensor([
-        [ 0.0,  0.0,  1.0],  # floor
-        [ 0.0,  0.0, -1.0],  # ceiling
-        [-1.0,  0.0,  0.0],  # right wall (+X)
-        [ 1.0,  0.0,  0.0],  # left wall (-X)
-        [ 0.0, -1.0,  0.0],  # orange wall (+Y)
-        [ 0.0,  1.0,  0.0],  # blue wall (-Y)
-    ], device=pos.device)  # (6, 3)
+    # Surface normals (cached — no per-tick GPU alloc)
+    surface_normals, default_normal = _get_cached_tensors(pos.device)
 
     # Find nearest surface per car
     nearest_idx = dists.argmin(dim=-1)  # (E, A)
@@ -177,7 +184,7 @@ def arena_collide_cars(state):
     state.car_surface_normal = torch.where(
         on_surface.unsqueeze(-1),
         nearest_normal,
-        torch.tensor([0.0, 0.0, 1.0], device=pos.device),
+        default_normal,
     )
 
     # ── Landing detection: reset jump state when touching any surface ──
@@ -196,7 +203,6 @@ def arena_collide_cars(state):
     lateral_speed = (vel * right_vec).sum(dim=-1, keepdim=True)  # (E, A, 1)
     # Normal: 30% lateral friction per tick; Handbrake: 5% (allows powersliding)
     handbrake_on = state.car_handbrake > 0.5  # (E, A)
-    friction_coeff = torch.where(handbrake_on, torch.tensor(0.05, device=vel.device),
-                                 torch.tensor(0.3, device=vel.device))  # (E, A)
-    friction_force = lateral_speed * right_vec * friction_coeff.unsqueeze(-1)
+    friction_coeff = torch.where(handbrake_on, 0.05, 0.3).unsqueeze(-1)  # (E, A, 1)
+    friction_force = lateral_speed * right_vec * friction_coeff
     vel -= friction_force * on_ground_mask.unsqueeze(-1).float()

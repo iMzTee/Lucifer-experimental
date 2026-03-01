@@ -127,31 +127,51 @@ class VisSender:
         i = self.env_idx
         n_agents = state.n_agents
 
+        # ── Single GPU→CPU transfer: batch all reads into one .cpu() call ──
+        # Ball: 3 vectors (pos, vel, ang_vel) = 9 floats
+        # Per car: 5 vectors (pos, vel, ang_vel, fwd, up) = 15 floats + 4 scalars
+        # Stack everything, transfer once, unpack on CPU
+        ball_data = torch.stack([
+            state.ball_pos[i], state.ball_vel[i], state.ball_ang_vel[i]
+        ]).cpu()  # (3, 3)
+
+        car_vecs = torch.stack([
+            state.car_pos[i], state.car_vel[i], state.car_ang_vel[i],
+            state.car_fwd[i], state.car_up[i],
+        ])  # (5, A, 3)
+        car_scalars = torch.stack([
+            state.car_boost[i], state.car_on_ground[i],
+            state.car_is_demoed[i], state.car_has_flip[i],
+        ])  # (4, A)
+        car_vecs_cpu = car_vecs.cpu()
+        car_scalars_cpu = car_scalars.cpu()
+        car_teams_cpu = state.car_team[i].cpu()
+        boost_pad_states = (state.boost_pad_timers[i] == 0).cpu().tolist()
+
+        # ── Unpack on CPU (no GPU sync from here) ──
         ball_phys = {
-            "pos": state.ball_pos[i].cpu().tolist(),
-            "vel": state.ball_vel[i].cpu().tolist(),
-            "ang_vel": state.ball_ang_vel[i].cpu().tolist(),
+            "pos": ball_data[0].tolist(),
+            "vel": ball_data[1].tolist(),
+            "ang_vel": ball_data[2].tolist(),
         }
 
         cars = []
         for a in range(n_agents):
             car = {
-                "team_num": int(state.car_team[i, a].item()),
+                "team_num": int(car_teams_cpu[a].item()),
                 "phys": {
-                    "pos": state.car_pos[i, a].cpu().tolist(),
-                    "vel": state.car_vel[i, a].cpu().tolist(),
-                    "ang_vel": state.car_ang_vel[i, a].cpu().tolist(),
-                    "forward": state.car_fwd[i, a].cpu().tolist(),
-                    "up": state.car_up[i, a].cpu().tolist(),
+                    "pos": car_vecs_cpu[0, a].tolist(),
+                    "vel": car_vecs_cpu[1, a].tolist(),
+                    "ang_vel": car_vecs_cpu[2, a].tolist(),
+                    "forward": car_vecs_cpu[3, a].tolist(),
+                    "up": car_vecs_cpu[4, a].tolist(),
                 },
-                "boost_amount": float(state.car_boost[i, a].item()) * 100,
-                "on_ground": bool(state.car_on_ground[i, a].item() > 0.5),
-                "is_demoed": bool(state.car_is_demoed[i, a].item() > 0.5),
-                "has_flip": bool(state.car_has_flip[i, a].item() > 0.5),
+                "boost_amount": float(car_scalars_cpu[0, a].item()) * 100,
+                "on_ground": bool(car_scalars_cpu[1, a].item() > 0.5),
+                "is_demoed": bool(car_scalars_cpu[2, a].item() > 0.5),
+                "has_flip": bool(car_scalars_cpu[3, a].item() > 0.5),
             }
             cars.append(car)
-
-        boost_pad_states = (state.boost_pad_timers[i] == 0).cpu().tolist()
 
         packet = {
             "ball_phys": ball_phys,
