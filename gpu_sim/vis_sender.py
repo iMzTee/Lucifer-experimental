@@ -1,9 +1,9 @@
 """vis_sender.py — Lightweight UDP sender for RocketSimVis.
 
-Extracts a single env from TensorState and sends game state over UDP
-to localhost:9273. Uses client-side extrapolation to show real-time
-movement: the background thread advances positions using velocity and
-gravity at game speed between sparse physics updates.
+Sends game state over UDP to localhost:9273. During collection bursts,
+sends real positions+velocities so RocketSimVis interpolates smoothly.
+When no new physics arrives (training phase), holds the last position
+with zero velocity to prevent drift.
 
 Cycles through random envs every few seconds. Zero overhead when disabled.
 """
@@ -14,18 +14,13 @@ import random
 import threading
 import time
 
-GRAVITY_Z = -650.0  # uu/s², matches constants.py
-FLOOR_Z = 17.0      # car resting height
-BALL_FLOOR_Z = 93.75 # ball resting height (BALL_RADIUS + 1)
-
 
 class VisSender:
     """Sends game state to RocketSimVis over UDP.
 
-    Between sparse physics snapshots, the background thread extrapolates
-    positions using velocity + gravity at game speed (30fps), giving
-    smooth real-time movement. When a new physics snapshot arrives, it
-    corrects the prediction.
+    During collection, raw physics states stream at full speed. Between
+    collections, the background thread resends the last state with zero
+    velocity so objects freeze in place instead of drifting.
 
     Args:
         n_envs: Total number of environments (for cycling).
@@ -34,6 +29,8 @@ class VisSender:
         port: UDP port for RocketSimVis (default 9273).
     """
 
+    STALE_TIMEOUT = 0.2  # seconds before switching to zero-velocity hold
+
     def __init__(self, n_envs=1, enabled=False, switch_interval=5.0, port=9273):
         self.n_envs = n_envs
         self.enabled = enabled
@@ -41,11 +38,14 @@ class VisSender:
         self.switch_interval = switch_interval
         self.env_idx = 0
         self._sock = None
-        self._state = None  # mutable state for extrapolation
+        self._last_packet = None   # latest raw packet (with velocity)
+        self._last_send_time = 0   # when send() was last called
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
         self._last_switch = time.time()
+
+        self._awaiting_ground_check = True
 
         if enabled:
             self.env_idx = random.randint(0, max(0, n_envs - 1))
@@ -56,59 +56,30 @@ class VisSender:
             print(f"[VIS] Watching env {self.env_idx}, switching every {switch_interval}s")
 
     def _switch_env(self):
-        """Switch to a new random env, clear state."""
+        """Switch to a new random env."""
         self.env_idx = random.randint(0, max(0, self.n_envs - 1))
         self._last_switch = time.time()
-        self._state = None
+        self._last_packet = None
+        self._awaiting_ground_check = True
         print(f"[VIS] Switched to env {self.env_idx}")
 
-    def _extrapolate(self, dt):
-        """Advance positions by dt seconds using velocity + gravity."""
-        s = self._state
-        if s is None:
-            return
-
-        # Ball
-        bp = s["ball_phys"]
-        bp["pos"][0] += bp["vel"][0] * dt
-        bp["pos"][1] += bp["vel"][1] * dt
-        bp["pos"][2] += bp["vel"][2] * dt
-        bp["vel"][2] += GRAVITY_Z * dt
-        # Floor clamp
-        if bp["pos"][2] < BALL_FLOOR_Z:
-            bp["pos"][2] = BALL_FLOOR_Z
-            bp["vel"][2] = max(0, bp["vel"][2])
-
-        # Cars
-        for c in s["cars"]:
-            p = c["phys"]
-            p["pos"][0] += p["vel"][0] * dt
-            p["pos"][1] += p["vel"][1] * dt
-            p["pos"][2] += p["vel"][2] * dt
-            if not c["on_ground"]:
-                p["vel"][2] += GRAVITY_Z * dt
-            # Floor clamp
-            if p["pos"][2] < FLOOR_Z:
-                p["pos"][2] = FLOOR_Z
-                p["vel"][2] = max(0, p["vel"][2])
-
-    def _build_packet(self):
-        """Build a zero-velocity packet from current extrapolated state."""
-        s = self._state
-        packet = {
+    @staticmethod
+    def _zero_vel(packet):
+        """Copy packet with all velocities zeroed."""
+        result = {
             "ball_phys": {
-                "pos": list(s["ball_phys"]["pos"]),
+                "pos": packet["ball_phys"]["pos"],
                 "vel": [0, 0, 0],
                 "ang_vel": [0, 0, 0],
             },
             "cars": [],
-            "boost_pad_states": s["boost_pad_states"],
+            "boost_pad_states": packet["boost_pad_states"],
         }
-        for c in s["cars"]:
-            packet["cars"].append({
+        for c in packet["cars"]:
+            result["cars"].append({
                 "team_num": c["team_num"],
                 "phys": {
-                    "pos": list(c["phys"]["pos"]),
+                    "pos": c["phys"]["pos"],
                     "vel": [0, 0, 0],
                     "ang_vel": [0, 0, 0],
                     "forward": c["phys"]["forward"],
@@ -119,37 +90,37 @@ class VisSender:
                 "is_demoed": c["is_demoed"],
                 "has_flip": c["has_flip"],
             })
-        return packet
+        return result
 
     def _send_loop(self):
-        """Background: extrapolate at game speed, send at 30fps."""
-        dt = 1.0 / 30
+        """Background: relay fresh frames or hold position at 30fps."""
         while not self._stop.is_set():
             now = time.time()
 
-            # Check if it's time to switch env
+            # Switch env on interval
             if now - self._last_switch >= self.switch_interval:
                 with self._lock:
                     self._switch_env()
 
             with self._lock:
-                if self._state is not None:
-                    self._extrapolate(dt)
-                    packet = self._build_packet()
-                else:
-                    packet = None
+                packet = self._last_packet
+                age = now - self._last_send_time
 
             if packet is not None:
+                # Fresh data → send with real velocity (RocketSimVis interpolates)
+                # Stale data → send with zero velocity (hold in place)
+                if age > self.STALE_TIMEOUT:
+                    packet = self._zero_vel(packet)
                 try:
                     self._sock.sendto(
                         json.dumps(packet).encode("utf-8"), self._addr)
                 except OSError:
                     pass
 
-            self._stop.wait(dt)
+            self._stop.wait(1.0 / 30)
 
     def send(self, state):
-        """Snapshot the current env's state, correcting extrapolation.
+        """Snapshot the current env's state.
 
         Args:
             state: TensorState from GPUEnvironment.
@@ -159,6 +130,16 @@ class VisSender:
 
         i = self.env_idx
         n_agents = state.n_agents
+
+        # After switching, skip envs where any car is off the ground
+        if self._awaiting_ground_check:
+            on_ground = state.car_on_ground[i, 0].item() > 0.5
+            if not on_ground:
+                # Try another env
+                self.env_idx = random.randint(0, max(0, self.n_envs - 1))
+                i = self.env_idx
+                return
+            self._awaiting_ground_check = False
 
         ball_phys = {
             "pos": state.ball_pos[i].cpu().tolist(),
@@ -186,14 +167,15 @@ class VisSender:
 
         boost_pad_states = (state.boost_pad_timers[i] == 0).cpu().tolist()
 
-        snapshot = {
+        packet = {
             "ball_phys": ball_phys,
             "cars": cars,
             "boost_pad_states": boost_pad_states,
         }
 
         with self._lock:
-            self._state = snapshot
+            self._last_packet = packet
+            self._last_send_time = time.time()
 
     def close(self):
         self._stop.set()
