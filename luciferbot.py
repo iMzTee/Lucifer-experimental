@@ -8,7 +8,6 @@ import os
 import time
 import json
 import gc
-import types
 import torch
 import numpy as np
 import sys
@@ -17,27 +16,14 @@ import threading
 from copy import deepcopy
 from torch.utils.tensorboard import SummaryWriter
 
-import rlgym_ppo.ppo
-import rlgym_ppo.util as rlgym_util
 from gpu_sim.collector import GPUCollector
 from gpu_sim.constants import STAGE_CONFIG
-
-
-# ─── GPU batch shuffling (avoids numpy→GPU index transfer) ───
-def _gpu_get_all_batches_shuffled(self, batch_size):
-    total_samples = self.rewards.shape[0]
-    indices = torch.randperm(total_samples, device=self.rewards.device)
-    start_idx = 0
-    while start_idx + batch_size <= total_samples:
-        yield self._get_samples(indices[start_idx:start_idx + batch_size])
-        start_idx += batch_size
-
-rlgym_ppo.ppo.ExperienceBuffer.get_all_batches_shuffled = _gpu_get_all_batches_shuffled
+from gpu_sim.ppo import PPOLearner, ExperienceBuffer
 
 
 # ─── Curriculum state persistence ───
 CURRICULUM_STATE_FILE = "curriculum_state.json"
-CURRICULUM_STAGE_NAMES = ["Foundations", "Game Play", "Mechanics", "Mastery"]
+CURRICULUM_STAGE_NAMES = ["Solo Mechanics", "1v1 Mechanics", "1v1 Game Sense", "2v2 Teamwork"]
 
 DEFAULT_CURRICULUM_STATE = {
     "stage": 0,
@@ -76,96 +62,10 @@ def log_memory_usage(label):
     print(msg)
 
 
-# ─── AMP monkey-patch ───
-def _amp_learn(self, exp):
-    if not hasattr(self, '_grad_scaler'):
-        self._grad_scaler = torch.amp.GradScaler('cuda')
-    scaler = self._grad_scaler
-
-    n_iterations = 0
-    n_minibatch_iterations = 0
-    mean_entropy = 0
-    mean_divergence = 0
-    mean_val_loss = 0
-    clip_fractions = []
-
-    t1 = time.time()
-    for epoch in range(self.n_epochs):
-        batches = exp.get_all_batches_shuffled(self.batch_size)
-        for batch in batches:
-            (batch_acts, batch_old_probs, batch_obs,
-             batch_target_values, batch_advantages) = batch
-            batch_acts = batch_acts.view(self.batch_size, -1)
-            self.policy_optimizer.zero_grad()
-            self.value_optimizer.zero_grad()
-
-            for minibatch_slice in range(0, self.batch_size, self.mini_batch_size):
-                start = minibatch_slice
-                stop = start + self.mini_batch_size
-                acts = batch_acts[start:stop].to(self.device)
-                obs = batch_obs[start:stop].to(self.device)
-                advantages = batch_advantages[start:stop].to(self.device)
-                old_probs = batch_old_probs[start:stop].to(self.device)
-                target_values = batch_target_values[start:stop].to(self.device)
-
-                with torch.amp.autocast('cuda'):
-                    vals = self.value_net(obs).view_as(target_values)
-                    log_probs, entropy = self.policy.get_backprop_data(obs, acts)
-                    log_probs = log_probs.view_as(old_probs)
-                    ratio = torch.exp(log_probs - old_probs)
-                    clipped = torch.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range)
-                    policy_loss = -torch.min(ratio * advantages, clipped * advantages).mean()
-                    minibatch_ratio = self.mini_batch_size / self.batch_size
-                    value_loss = self.value_loss_fn(vals, target_values) * minibatch_ratio
-                    ppo_loss = (policy_loss - entropy * self.ent_coef) * minibatch_ratio
-
-                with torch.no_grad():
-                    log_ratio = log_probs.float() - old_probs.float()
-                    kl = (torch.exp(log_ratio) - 1) - log_ratio
-                    kl = kl.mean().detach().cpu().item()
-                    clip_fraction = torch.mean(
-                        (torch.abs(ratio.float() - 1) > self.clip_range).float()).cpu().item()
-                    clip_fractions.append(clip_fraction)
-
-                scaler.scale(ppo_loss).backward()
-                scaler.scale(value_loss).backward()
-                mean_val_loss += (value_loss / minibatch_ratio).cpu().detach().item()
-                mean_divergence += kl
-                mean_entropy += entropy.cpu().detach().item()
-                n_minibatch_iterations += 1
-
-            scaler.unscale_(self.policy_optimizer)
-            scaler.unscale_(self.value_optimizer)
-            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), max_norm=0.5)
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
-            scaler.step(self.policy_optimizer)
-            scaler.step(self.value_optimizer)
-            scaler.update()
-            n_iterations += 1
-
-    if n_iterations == 0: n_iterations = 1
-    if n_minibatch_iterations == 0: n_minibatch_iterations = 1
-
-    mean_entropy /= n_minibatch_iterations
-    mean_divergence /= n_minibatch_iterations
-    mean_val_loss /= n_minibatch_iterations
-    mean_clip = np.mean(clip_fractions) if clip_fractions else 0
-
-    self.cumulative_model_updates += n_iterations
-
-    return {
-        "PPO Batch Consumption Time": (time.time() - t1) / n_iterations,
-        "Cumulative Model Updates": self.cumulative_model_updates,
-        "Policy Entropy": mean_entropy,
-        "Mean KL Divergence": mean_divergence,
-        "Value Function Loss": mean_val_loss,
-        "SB3 Clip Fraction": mean_clip,
-    }
-
-
 # ─── CurriculumTracker ───
 class CurriculumTracker:
-    ENTROPY_ADVANCE     = [0.5, 0.5, 0.5]
+    # Adjusted for 5-bin action space (max entropy ~10.1 vs old ~7.6)
+    ENTROPY_ADVANCE     = [0.7, 0.7, 0.7]
     ENTROPY_CONSECUTIVE = 3
     MIN_STAGE_ITERS     = [500, 2000, 2500]
     CLIP_HIGH_THRESH    = 0.25
@@ -238,7 +138,7 @@ class CurriculumTracker:
 
 # ─── GPU Learner ───
 class GPULearner:
-    def __init__(self, n_envs=10000, ts_per_iteration=200000):
+    def __init__(self, ts_per_iteration=200000):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         assert self.device == "cuda", "GPU sim requires CUDA!"
         self.checkpoints_folder = "Checkpoints_LuciferBot"
@@ -248,38 +148,39 @@ class GPULearner:
         self.curriculum = CurriculumTracker(curriculum_state)
         self.ts_per_iteration = ts_per_iteration
 
-        stage_name = CURRICULUM_STAGE_NAMES[self.curriculum.stage]
+        # Read n_envs from stage config
+        stage = self.curriculum.stage
+        cfg = STAGE_CONFIG.get(stage, STAGE_CONFIG[0])
+        n_envs = cfg.get("n_envs", 40000)
+        n_agents = cfg.get("n_agents", 4)
+
+        stage_name = CURRICULUM_STAGE_NAMES[stage]
         print(f"\n{'='*60}")
-        print(f"  LuciferBot — Stage {self.curriculum.stage}: {stage_name}")
-        print(f"  {n_envs:,} parallel environments on GPU")
+        print(f"  LuciferBot — Stage {stage}: {stage_name}")
+        print(f"  {n_envs:,} envs x {n_agents} agents on GPU")
         print(f"  Steps per iteration: {ts_per_iteration:,}")
         print(f"{'='*60}")
 
-        # GPU Collector (replaces VectorizedCollector)
+        # GPU Collector
         self.agent = GPUCollector(
             n_envs=n_envs, device=self.device,
-            standardize_obs=True, stage=self.curriculum.stage)
+            standardize_obs=True, stage=stage)
 
         # PPO Learner
-        self.ppo_learner = rlgym_ppo.ppo.PPOLearner(
+        self.ppo_learner = PPOLearner(
             obs_space_size=127,
             act_space_size=8,
             device=self.device,
             batch_size=50000,
             mini_batch_size=50000,
             n_epochs=2,
-            policy_type=1,  # MultiDiscrete
             policy_layer_sizes=(2048, 2048, 1024, 1024),
             critic_layer_sizes=(2048, 2048, 1024, 1024),
-            continuous_var_range=0.1,
             policy_lr=self.curriculum.policy_lr,
             critic_lr=self.curriculum.critic_lr,
             clip_range=0.2,
             ent_coef=self.curriculum.ent_coef,
         )
-
-        # AMP monkey-patch
-        self.ppo_learner.learn = types.MethodType(_amp_learn, self.ppo_learner)
         print("[*] AMP mixed-precision training enabled")
 
         # Background training state
@@ -377,8 +278,11 @@ class GPULearner:
             save_curriculum_state(self.curriculum.to_state_dict())
             print(f"\n[CURRICULUM] {self.curriculum.restart_reason}")
             self.save_stage_checkpoint(self.curriculum.stage, epoch)
-            # Update collector stage (no restart needed — GPU sim is lightweight)
+            # Update collector stage (handles n_agents/n_envs re-init)
             self.agent.set_stage(self.curriculum.stage)
+            # Re-sync frozen policy after stage change
+            self._frozen_policy.load_state_dict(self.ppo_learner.policy.state_dict())
+            self.agent.policy = self._frozen_policy
             self.curriculum.restart_requested = False
 
         if epoch % 50 == 0:
@@ -468,7 +372,7 @@ class GPULearner:
 
         # 6. GPU experience buffer (no CPU transfer)
         t_buf = time.time()
-        buffer = rlgym_ppo.ppo.ExperienceBuffer(
+        buffer = ExperienceBuffer(
             max_size=self.ts_per_iteration + 20000, device="cuda", seed=123)
         buffer.submit_experience(
             states, actions, log_probs, rewards_norm, next_states, dones, truncated, vt, adv)
@@ -548,8 +452,11 @@ class GPULearner:
 
 if __name__ == "__main__":
     # ── Configuration ──
-    # 40k envs: ~78k SPS on RTX 2060 (6GB), peak ~4.2GB VRAM
-    N_ENVS = 40000
+    # n_envs is read from STAGE_CONFIG per stage:
+    #   Stage 0 (1v0): 160k envs x 1 agent
+    #   Stage 1 (1v1): 80k envs x 2 agents
+    #   Stage 2 (1v1): 80k envs x 2 agents
+    #   Stage 3 (2v2): 40k envs x 4 agents
     TS_PER_ITERATION = 200000
 
     print(f"\n[*] LuciferBot")
@@ -557,11 +464,10 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**2
         print(f"[*] VRAM: {vram_total:.0f} MB")
-    print(f"[*] Envs: {N_ENVS:,}")
     print(f"[*] Steps/iter: {TS_PER_ITERATION:,}")
 
     try:
-        learner = GPULearner(n_envs=N_ENVS, ts_per_iteration=TS_PER_ITERATION)
+        learner = GPULearner(ts_per_iteration=TS_PER_ITERATION)
         while True:
             learner.learn()
     except KeyboardInterrupt:

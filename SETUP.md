@@ -104,9 +104,6 @@ This installs:
 - `numpy==1.26.4` — array operations
 - `psutil==7.2.2` — memory monitoring
 - `tensorboard==2.20.0` — training metrics logging
-- `rlgym-ppo` — PPO implementation (from specific git commit)
-- `rlgym-sim` — Rocket League gym interface (from specific git commit)
-- `rocketsim==2.2.0` — Rocket League physics bindings
 
 ### 7. Verify the installation
 
@@ -143,25 +140,23 @@ Press `Ctrl+C` to stop. It saves a checkpoint before exiting.
 
 ## Configuration
 
-All configuration is at the bottom of `luciferbot.py`:
+N_ENVS is automatically set per stage in `gpu_sim/constants.py` STAGE_CONFIG.
+Only `TS_PER_ITERATION` is configurable in `luciferbot.py`:
 
 ```python
-N_ENVS = 40000              # Parallel environments on GPU
 TS_PER_ITERATION = 200000   # Timesteps collected per training iteration
 ```
 
-### N_ENVS by GPU
+N_ENVS adjusts automatically per stage to keep VRAM usage stable (~2.5GB):
 
-| GPU | VRAM | Recommended N_ENVS | Expected SPS |
-|---|---|---|---|
-| RTX 2060 | 6 GB | 40,000 | ~75,000 |
-| RTX 3060 | 12 GB | 80,000 | ~120,000 |
-| RTX 3070 | 8 GB | 60,000 | ~100,000 |
-| RTX 3080 | 10 GB | 80,000 | ~130,000 |
-| RTX 4070 | 12 GB | 100,000 | ~160,000 |
-| RTX 4090 | 24 GB | 200,000 | ~300,000 |
+| Stage | Format | N_ENVS | Agents | Description |
+|---|---|---|---|---|
+| 0 | 1v0 | 160,000 | 1 | Solo mechanics |
+| 1 | 1v1 | 80,000 | 2 | 1v1 mechanics |
+| 2 | 1v1 | 80,000 | 2 | 1v1 game sense |
+| 3 | 2v2 | 40,000 | 4 | 2v2 teamwork |
 
-If you get CUDA out-of-memory errors, reduce N_ENVS. Start with 10,000 and increase.
+To adjust for your GPU, edit `STAGE_CONFIG` in `gpu_sim/constants.py`.
 
 ### PPO hyperparameters
 
@@ -181,16 +176,27 @@ These are in the `GPULearner.__init__` method:
 
 ### Curriculum stages
 
-Training progresses through 4 stages automatically:
+Training progresses through 4 stages automatically (1v0 → 1v1 → 2v2):
 
-| Stage | Name | Tick Skip | Timeout | Description |
-|---|---|---|---|---|
-| 0 | Foundations | 8 | 300 | Basic movement, ball chasing |
-| 1 | Game Play | 8 | 400 | Game sense, positioning |
-| 2 | Mechanics | 4 | 600 | Finer control (half tick skip) |
-| 3 | Mastery | 2 | 1200 | Full precision (quarter tick skip) |
+| Stage | Name | Format | Tick Skip | Timeout | Description |
+|---|---|---|---|---|---|
+| 0 | Solo Mechanics | 1v0 | 2 | 1800 | Speed flips, wave dashes, wall driving, aerials |
+| 1 | 1v1 Mechanics | 1v1 | 2 | 2400 | Air dribbles, flip resets, wall plays, shooting |
+| 2 | 1v1 Game Sense | 1v1 | 2 | 3600 | Advanced plays, saves, game reading |
+| 3 | 2v2 Teamwork | 2v2 | 2 | 4800 | Rotation, passing, team coordination |
 
-Stage advancement happens when entropy drops below 0.5 for 3 consecutive iterations, indicating the policy has converged and needs new challenges.
+All stages use tick_skip=2 (60Hz decisions) for smooth, precise mechanics.
+Stage advancement happens when entropy drops below 0.7 for 3 consecutive iterations.
+
+### Render mode
+
+Watch the bot play in real-time (1 environment, ~100MB VRAM):
+
+```bash
+python render_bot.py [--stage N] [--checkpoint PATH]
+```
+
+Controls: R=reset, Q=quit, 1-4=switch stage, Space=pause.
 
 ---
 
@@ -199,6 +205,7 @@ Stage advancement happens when entropy drops below 0.5 for 3 consecutive iterati
 ```
 Lucifer/
   luciferbot.py              # Main training script
+  render_bot.py              # 2D top-down visualizer (pygame)
   requirements.txt           # Pinned Python dependencies
   setup_ubuntu.sh            # One-command setup script
   .gitignore                 # Git ignore patterns
@@ -206,15 +213,16 @@ Lucifer/
   Checkpoints_LuciferBot/    # Auto-generated: model checkpoints
   gpu_sim/                   # GPU simulation package
     __init__.py
-    arena.py                 # Arena boundary enforcement
-    collector.py             # Experience collection (replaces CPU collector)
-    collision.py             # Ball-car, ball-wall collision detection
-    constants.py             # Physics constants, arena dimensions, stage config
-    environment.py           # Batched GPU physics simulation
+    arena.py                 # Arena boundary + multi-surface detection
+    collector.py             # Experience collection (variable n_agents)
+    collision.py             # Ball-car, car-car collision detection
+    constants.py             # Physics constants, stage config, agent layouts
+    environment.py           # Batched GPU physics + mechanic scenarios
     game_state.py            # TensorState: all game state as GPU tensors
-    observations.py          # Observation vector construction
-    physics.py               # Car physics, boost, jumping, demolitions
-    rewards.py               # Reward function computation
+    observations.py          # 127-element obs with zero-padding
+    physics.py               # Car physics, wall driving, surface-relative
+    policy.py                # Custom 5-bin MultiDiscrete policy
+    rewards.py               # 17 reward signals + events + team spirit
     utils.py                 # Quaternion math utilities
   collision_meshes/          # Arena collision mesh data
     soccar/mesh_*.cmf        # 16 mesh files for arena geometry
@@ -258,8 +266,6 @@ While training runs, each iteration prints:
 **nvidia-smi not found**: Install NVIDIA drivers: `sudo apt install nvidia-driver-550`
 
 **CUDA not available in Python**: Make sure you installed the CUDA-enabled PyTorch, not the CPU version. Reinstall with the `--index-url` flag from step 5.
-
-**Import errors for rlgym-ppo or rlgym-sim**: Run `pip install -r requirements.txt` again. These install from specific git commits.
 
 **Training is slow (low SPS)**: Check that no other GPU-heavy processes are running (`nvidia-smi`). Close browsers, games, etc.
 

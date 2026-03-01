@@ -2,6 +2,3 @@ torch==2.6.0+cu124
 numpy==1.26.4
 psutil==7.2.2
 tensorboard==2.20.0
-rlgym-ppo @ git+https://github.com/AechPro/rlgym-ppo.git@4ffd2e924198bf4b2d59f4bf280b29919d7c07ea
-rlgym-sim @ git+https://github.com/AechPro/rocket-league-gym-sim@a1240530239d6b7671147b4f97e9b5e130d0acce
-rocketsim==2.2.0
