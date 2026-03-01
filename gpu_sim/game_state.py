@@ -60,6 +60,9 @@ class TensorState:
         self.car_surface_normal = torch.zeros(E, A, 3, device=device)
         self.car_surface_normal[:, :, 2] = 1.0
 
+        # Handbrake state (set by physics, read by arena friction)
+        self.car_handbrake = torch.zeros(E, A, device=device)
+
         # Team assignment from layout
         self.car_team = torch.tensor(
             layout["car_team"], dtype=torch.long, device=device

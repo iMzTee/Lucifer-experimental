@@ -189,10 +189,14 @@ def arena_collide_cars(state):
     state.car_is_jumping[landing] = 0.0
     state.car_jump_timer[landing] = 0.0
 
-    # ── Surface friction (simplified) ──
+    # ── Surface friction (handbrake-aware) ──
     on_ground_mask = state.car_on_ground > 0.5
     # Lateral friction: reduce velocity perpendicular to forward and surface normal
     right_vec = torch.cross(state.car_up, state.car_fwd, dim=-1)  # (E, A, 3)
     lateral_speed = (vel * right_vec).sum(dim=-1, keepdim=True)  # (E, A, 1)
-    friction_force = lateral_speed * right_vec * 0.3  # 30% lateral friction per tick
+    # Normal: 30% lateral friction per tick; Handbrake: 5% (allows powersliding)
+    handbrake_on = state.car_handbrake > 0.5  # (E, A)
+    friction_coeff = torch.where(handbrake_on, torch.tensor(0.05, device=vel.device),
+                                 torch.tensor(0.3, device=vel.device))  # (E, A)
+    friction_force = lateral_speed * right_vec * friction_coeff.unsqueeze(-1)
     vel -= friction_force * on_ground_mask.unsqueeze(-1).float()

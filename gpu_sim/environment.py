@@ -139,20 +139,26 @@ class GPUEnvironment:
         s.car_up = up
 
     # ═══════════════════════════════════════════════════
-    # Stage 0: 1v0 — 7 mechanic-specific scenarios
+    # Stage 0: 1v0 — 5 ground-only scenarios
     # ═══════════════════════════════════════════════════
 
     def _reset_stage0_scenarios(self, mask, n):
-        """Stage 0 (1v0): mechanic-focused scenarios."""
+        """Stage 0 (1v0): ground-only mechanic-focused scenarios."""
         r = torch.rand(n, device=self.device)
         indices = mask.nonzero(as_tuple=True)[0]
 
-        # Scenario distribution:
-        # Kickoff 20%, SpeedFlip 15%, WaveDash 15%, GroundDribble 15%,
-        # WallDrive 10%, AerialTouch 15%, FreePlay 10%
-        thresholds = [0.20, 0.35, 0.50, 0.65, 0.75, 0.90, 1.00]
+        # Scenario distribution (all ground-only):
+        # Kickoff 25%, SpeedFlip 20%, GroundDribble 20%, AerialTouch 15%, FreePlay 20%
+        thresholds = [0.25, 0.45, 0.65, 0.80, 1.00]
+        scenarios = [
+            self._reset_kickoff_1v0,
+            self._reset_speed_flip_drill,
+            self._reset_ground_dribble,
+            self._reset_aerial_touch,
+            self._reset_free_play_1v0,
+        ]
 
-        for scenario_idx in range(7):
+        for scenario_idx in range(5):
             lo = 0.0 if scenario_idx == 0 else thresholds[scenario_idx - 1]
             hi = thresholds[scenario_idx]
             local_mask = (r >= lo) & (r < hi)
@@ -161,21 +167,7 @@ class GPUEnvironment:
             full_mask = torch.zeros(self.n_envs, dtype=torch.bool, device=self.device)
             full_mask[indices[local_mask]] = True
             n_s = full_mask.sum().item()
-
-            if scenario_idx == 0:
-                self._reset_kickoff_1v0(full_mask, n_s)
-            elif scenario_idx == 1:
-                self._reset_speed_flip_drill(full_mask, n_s)
-            elif scenario_idx == 2:
-                self._reset_wave_dash_drill(full_mask, n_s)
-            elif scenario_idx == 3:
-                self._reset_ground_dribble(full_mask, n_s)
-            elif scenario_idx == 4:
-                self._reset_wall_drive(full_mask, n_s)
-            elif scenario_idx == 5:
-                self._reset_aerial_touch(full_mask, n_s)
-            else:
-                self._reset_free_play_1v0(full_mask, n_s)
+            scenarios[scenario_idx](full_mask, n_s)
 
     def _reset_kickoff_1v0(self, mask, n):
         """Solo kickoff: random kickoff position, ball at center."""

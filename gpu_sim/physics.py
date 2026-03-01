@@ -38,7 +38,8 @@ def apply_car_controls(state, actions, dt=DT):
     roll_in = actions[:, :, 4]
     jump = actions[:, :, 5]
     boost = actions[:, :, 6]
-    # handbrake = actions[:, :, 7]  # not used in simplified physics
+    handbrake = actions[:, :, 7]
+    state.car_handbrake = handbrake
 
     on_ground = state.car_on_ground > 0.5    # (E, 4) bool
     in_air = ~on_ground
@@ -74,6 +75,14 @@ def apply_car_controls(state, actions, dt=DT):
         steer_ang_vel * ground_mask.unsqueeze(-1) +
         state.car_ang_vel * (1.0 - ground_mask.unsqueeze(-1))
     )
+
+    # ── Velocity-heading alignment (front wheel grip) ──
+    # On ground without handbrake: redirect lateral velocity toward forward direction
+    # Only correct XY components — preserve Z to prevent floating
+    lateral_vel = state.car_vel - (state.car_vel * fwd).sum(dim=-1, keepdim=True) * fwd  # (E, A, 3)
+    no_handbrake = (handbrake < 0.5) & on_ground  # (E, A)
+    grip_mask = 0.9 * no_handbrake.unsqueeze(-1).float()  # (E, A, 1)
+    state.car_vel[:, :, :2] -= lateral_vel[:, :, :2] * grip_mask
 
     # ── Air physics ──
     air_mask = in_air.float()  # (E, 4)
@@ -227,10 +236,15 @@ def _apply_jump_flip(state, jump_input, pitch_in, yaw_in, dt):
         world_dodge = (fwd * dodge_dir_y.unsqueeze(-1) +
                        right * dodge_dir_x.unsqueeze(-1))  # (E, 4, 3)
 
+        # Directional dodge: horizontal impulse
         flip_mask = (can_flip & has_dir).unsqueeze(-1).float()
         state.car_vel[:, :, :2] += (world_dodge[:, :, :2] * FLIP_IMPULSE * flip_mask[:, :, :2])
 
-        # Cancel downward velocity on flip
+        # Double jump (no direction): upward impulse
+        double_jump = can_flip & (~has_dir)
+        state.car_vel[:, :, 2] += JUMP_IMPULSE * double_jump.float()
+
+        # Cancel downward velocity on any flip/double-jump
         cancel_mask = can_flip & (state.car_vel[:, :, 2] < 0)
         state.car_vel[:, :, 2] = torch.where(
             cancel_mask, torch.zeros_like(state.car_vel[:, :, 2]), state.car_vel[:, :, 2])
