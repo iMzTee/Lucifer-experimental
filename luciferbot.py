@@ -313,7 +313,7 @@ class GPULearner:
         log_memory_usage("post-training")
 
         # Append iteration metrics to log file for monitoring
-        log_path = "training_log.csv"
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training_log.csv")
         write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
         with open(log_path, "a") as f:
             if write_header:
