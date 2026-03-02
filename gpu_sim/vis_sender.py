@@ -31,6 +31,7 @@ class VisSender:
     """
 
     STALE_TIMEOUT = 0.5  # seconds before switching to zero-velocity hold
+    SPEED_SCALE = 2.0    # playback speed multiplier for viewer
 
     def __init__(self, n_envs=1, enabled=False, switch_interval=10.0, port=9273):
         self.n_envs = n_envs
@@ -221,6 +222,15 @@ class VisSender:
             "cars": cars,
             "boost_pad_states": boost_pad_states,
         }
+
+        # Scale velocities for playback speed
+        if self.SPEED_SCALE != 1.0:
+            s = self.SPEED_SCALE
+            packet["ball_phys"]["vel"] = [v * s for v in ball_phys["vel"]]
+            packet["ball_phys"]["ang_vel"] = [v * s for v in ball_phys["ang_vel"]]
+            for c in packet["cars"]:
+                c["phys"]["vel"] = [v * s for v in c["phys"]["vel"]]
+                c["phys"]["ang_vel"] = [v * s for v in c["phys"]["ang_vel"]]
 
         with self._lock:
             self._last_packet = packet
