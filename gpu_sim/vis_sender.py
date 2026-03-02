@@ -151,11 +151,11 @@ class VisSender:
                 age = now - self._last_send_time
 
             if packet is not None and age > 0.05:
-                # Only send from background if no recent direct send (>50ms)
+                # Resend last known state without extrapolation to avoid jitter
                 if age > self.STALE_TIMEOUT:
                     self._send_udp(self._zero_vel(packet))
                 else:
-                    self._send_udp(self._extrapolate(packet, age))
+                    self._send_udp(packet)
 
             self._stop.wait(1.0 / 240)
 
