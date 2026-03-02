@@ -25,6 +25,8 @@ class VisSender:
         port: UDP port for RocketSimVis (default 9273).
     """
 
+    FRAME_SKIP = 4  # only send every Nth call → 4x playback speed
+
     def __init__(self, n_envs=1, enabled=False, switch_interval=10.0, port=9273):
         self.n_envs = n_envs
         self.enabled = enabled
@@ -33,6 +35,7 @@ class VisSender:
         self.env_idx = 0
         self._sock = None
         self._last_switch = time.time()
+        self._frame_count = 0
 
         if enabled:
             self.env_idx = random.randint(0, max(0, n_envs - 1))
@@ -60,6 +63,11 @@ class VisSender:
             state: TensorState from GPUEnvironment.
         """
         if not self.enabled:
+            return
+
+        # Frame skip for faster playback
+        self._frame_count += 1
+        if self._frame_count % self.FRAME_SKIP != 0:
             return
 
         # Switch env on interval
