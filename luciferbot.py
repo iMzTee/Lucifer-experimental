@@ -67,7 +67,7 @@ def log_memory_usage(label):
 # ─── CurriculumTracker ───
 class CurriculumTracker:
     # Adjusted for 5-bin action space (max entropy ~10.1 vs old ~7.6)
-    ENTROPY_ADVANCE     = [0.7, 0.7, 0.7, 0.7, 0.7]
+    ENTROPY_ADVANCE     = [4.0, 4.0, 4.0, 4.0, 4.0]
     ENTROPY_CONSECUTIVE = 3
     MIN_STAGE_ITERS     = [500, 500, 1000, 2000, 2500]
     CLIP_HIGH_THRESH    = 0.25
@@ -108,7 +108,7 @@ class CurriculumTracker:
 
         if self.clip_high_count >= self.CLIP_HIGH_ITERS:
             new_lr = round(self.policy_lr * 0.80, 7)
-            if new_lr >= 1e-4:
+            if new_lr >= 3e-5:
                 self.policy_lr = new_lr
                 self.clip_high_count = 0
                 self.restart_reason = (
@@ -125,7 +125,7 @@ class CurriculumTracker:
 
         if self.val_loss_high_count >= self.VAL_LOSS_HIGH_ITERS:
             new_lr = round(self.critic_lr * 0.80, 7)
-            if new_lr >= 1e-4:
+            if new_lr >= 3e-5:
                 self.critic_lr = new_lr
                 self.val_loss_high_count = 0
                 self.restart_reason = (
@@ -209,9 +209,9 @@ class GPULearner:
             obs_space_size=127,
             act_space_size=8,
             device=self.device,
-            batch_size=50000,
-            mini_batch_size=50000,
-            n_epochs=2,
+            batch_size=100000,
+            mini_batch_size=100000,
+            n_epochs=1,
             policy_layer_sizes=(1024, 1024, 1024, 512),
             critic_layer_sizes=(1024, 1024, 1024, 512),
             policy_lr=self.curriculum.policy_lr,
@@ -311,6 +311,14 @@ class GPULearner:
         print(f"  Stage Iter Count  : {self.curriculum.stage_iter_count}")
         print("=" * 55)
         log_memory_usage("post-training")
+
+        # Append iteration metrics to log file for monitoring
+        log_path = "training_log.csv"
+        write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+        with open(log_path, "a") as f:
+            if write_header:
+                f.write("iter,stage,total_steps,sps,mean_reward,entropy,clip_frac,value_loss,wall_time\n")
+            f.write(f"{epoch},{stage},{cumul_steps},{sps},{mean_reward:.6f},{entropy:.4f},{clip:.4f},{value_loss:.4f},{wall_time:.2f}\n")
 
         if self.curriculum.update(mean_reward, entropy, clip, value_loss):
             save_curriculum_state(self.curriculum.to_state_dict())
@@ -497,7 +505,7 @@ if __name__ == "__main__":
     #   Stage 3 (1v1): 80k envs x 2 agents  — 1v1 Basics
     #   Stage 4 (1v1): 80k envs x 2 agents  — 1v1 Advanced
     #   Stage 5 (2v2): 40k envs x 4 agents  — 2v2 Teamwork
-    TS_PER_ITERATION = 320000
+    TS_PER_ITERATION = 640000
 
     print(f"\n[*] LuciferBot")
     print(f"[*] Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
