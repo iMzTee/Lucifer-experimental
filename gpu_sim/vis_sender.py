@@ -43,11 +43,15 @@ class VisSender:
             self._addr = ("127.0.0.1", port)
             print(f"[VIS] Watching env {self.env_idx}, switching every {switch_interval}s")
 
-    def _switch_env(self):
-        """Switch to a new random env."""
-        self.env_idx = random.randint(0, max(0, self.n_envs - 1))
+    def _switch_env(self, state):
+        """Switch to the freshest env (lowest step_count)."""
+        # Pick from the 50 freshest envs to add variety
+        steps = state.step_count.cpu()  # (E,)
+        _, sorted_idx = steps.sort()
+        pool = sorted_idx[:50]
+        self.env_idx = int(pool[random.randint(0, len(pool) - 1)].item())
         self._last_switch = time.time()
-        print(f"[VIS] Switched to env {self.env_idx}")
+        print(f"[VIS] Switched to env {self.env_idx} (step {int(steps[self.env_idx].item())})")
 
     def _send_udp(self, packet):
         """Send a packet over UDP (no-throw)."""
@@ -73,7 +77,7 @@ class VisSender:
         # Switch env on interval
         now = time.time()
         if now - self._last_switch >= self.switch_interval:
-            self._switch_env()
+            self._switch_env(state)
 
         i = self.env_idx
         n_agents = state.n_agents
