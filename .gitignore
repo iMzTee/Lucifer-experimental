@@ -16,4 +16,3 @@ wandb/
 .claude/
 *.log
 curriculum_state.json
-rocketsimvis/
