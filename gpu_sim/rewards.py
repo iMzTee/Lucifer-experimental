@@ -305,25 +305,21 @@ class GPURewards:
         if weights[8] > 0:
             rewards += weights[8]
 
-        # ── R10: AirReward (binary airborne signal) ──
+        # ── R10: AirReward (near-ball only: no reward for jumping far away) ──
         if weights[9] > 0:
-            rewards += weights[9] * (s.car_on_ground < 0.5).float()
+            in_air = (s.car_on_ground < 0.5).float()
+            near_ball = (to_ball_dist < 1500.0).float()  # only within 1500uu of ball
+            rewards += weights[9] * (in_air * near_ball)
 
-        # ── R11: BoostConservation ──
-        # Reward having boost (sqrt shape) + penalize wasteful usage
-        # Wasteful = boost spent (delta < 0) without gaining speed toward ball
+        # ── R11: BoostConservation (waste penalty only, no hoarding reward) ──
+        # Penalize using boost without productive speed gain toward ball
         if weights[10] > 0:
-            # Base: reward for current boost level
-            boost_reward = torch.sqrt(s.car_boost)
-
-            # Penalty: boost spent without productive speed gain
             boost_spent = (self.prev_player_boost - s.car_boost).clamp(min=0)  # (E, A)
             speed_to_ball = (s.car_vel * to_ball_dir).sum(dim=-1) / CAR_MAX_SPEED  # (E, A)
             speed_gained = speed_to_ball.clamp(min=0)
-            # If spending boost but not moving toward ball effectively, penalize
+            # Penalty scales with how much boost was wasted (used without approaching ball)
             waste_penalty = boost_spent * (1.0 - speed_gained).clamp(min=0)
-
-            rewards += weights[10] * (boost_reward - 0.5 * waste_penalty)
+            rewards -= weights[10] * waste_penalty
 
         # ── Event Reward ──
         current_ev = torch.zeros(E, A, 5, device=self.device)
