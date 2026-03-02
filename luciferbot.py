@@ -300,6 +300,8 @@ class GPULearner:
         t_coll = meta['t_coll']
         t_train = meta['t_train']
         mean_reward = meta['mean_reward']
+        max_reward = meta.get('max_reward', 0)
+        min_reward = meta.get('min_reward', 0)
         cumul_steps = meta['cumul_steps']
         wall_time = meta['wall_time']
         stage = self.curriculum.stage
@@ -320,6 +322,8 @@ class GPULearner:
         print(f"  Iter Time         : {wall_time:.2f}s  (collect: {t_coll:.1f}s  train: {t_train:.1f}s  wait: {t_wait:.1f}s)")
         print(f"  Global SPS        : {sps:,}")
         print(f"  Mean Reward       : {mean_reward:.6f}")
+        print(f"  Max Reward        : {max_reward:.6f}")
+        print(f"  Min Reward        : {min_reward:.6f}")
         print(f"  Entropy           : {entropy:.4f}")
         print(f"  Clip Fraction     : {clip:.4f}")
         print(f"  Value Loss        : {value_loss:.4f}")
@@ -332,8 +336,8 @@ class GPULearner:
         write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
         with open(log_path, "a") as f:
             if write_header:
-                f.write("iter,stage,total_steps,sps,mean_reward,entropy,clip_frac,value_loss,wall_time\n")
-            f.write(f"{epoch},{stage},{cumul_steps},{sps},{mean_reward:.6f},{entropy:.4f},{clip:.4f},{value_loss:.4f},{wall_time:.2f}\n")
+                f.write("iter,stage,total_steps,sps,mean_reward,max_reward,min_reward,entropy,clip_frac,value_loss,wall_time\n")
+            f.write(f"{epoch},{stage},{cumul_steps},{sps},{mean_reward:.6f},{max_reward:.6f},{min_reward:.6f},{entropy:.4f},{clip:.4f},{value_loss:.4f},{wall_time:.2f}\n")
 
         # Lightweight sync: log + checkpoints to Windows desktop
         _sync_to_desktop(checkpoints_only=True)
@@ -408,6 +412,8 @@ class GPULearner:
 
         # Reward normalization on GPU
         mean_reward = float(rewards.mean().item())
+        max_reward = float(rewards.max().item())
+        min_reward = float(rewards.min().item())
         rewards_std = rewards.std()
         if rewards_std > 1e-6:
             rewards_norm = ((rewards - rewards.mean()) / (rewards_std + 1e-8)).clamp(-10.0, 10.0)
@@ -460,6 +466,8 @@ class GPULearner:
             't_coll': t_coll,
             't_wait': t_wait,
             'mean_reward': mean_reward,
+            'max_reward': max_reward,
+            'min_reward': min_reward,
             'cumul_steps': self.agent.cumulative_timesteps,
             'iter_start': iter_start,
         }
