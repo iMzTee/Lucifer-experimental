@@ -8,6 +8,7 @@ import os
 import time
 import json
 import gc
+import subprocess
 import torch
 import numpy as np
 import sys
@@ -20,6 +21,20 @@ from gpu_sim.collector import GPUCollector
 from gpu_sim.constants import STAGE_CONFIG
 from gpu_sim.ppo import PPOLearner, ExperienceBuffer
 from gpu_sim.vis_sender import VisSender
+
+
+# ─── Desktop sync ───
+_SYNC_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_to_desktop.sh")
+
+def _sync_to_desktop(checkpoints_only=False):
+    """Sync project to Windows desktop in background (non-blocking)."""
+    try:
+        args = [_SYNC_SCRIPT]
+        if checkpoints_only:
+            args.append("--checkpoints-only")
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass  # never block training on sync failure
 
 
 # ─── Curriculum state persistence ───
@@ -320,6 +335,9 @@ class GPULearner:
                 f.write("iter,stage,total_steps,sps,mean_reward,entropy,clip_frac,value_loss,wall_time\n")
             f.write(f"{epoch},{stage},{cumul_steps},{sps},{mean_reward:.6f},{entropy:.4f},{clip:.4f},{value_loss:.4f},{wall_time:.2f}\n")
 
+        # Lightweight sync: log + checkpoints to Windows desktop
+        _sync_to_desktop(checkpoints_only=True)
+
         if self.curriculum.update(mean_reward, entropy, clip, value_loss):
             save_curriculum_state(self.curriculum.to_state_dict())
             print(f"\n[CURRICULUM] {self.curriculum.restart_reason}")
@@ -456,6 +474,7 @@ class GPULearner:
         self.ppo_learner.save_to(path)
         with open(os.path.join(path, "VARS.json"), "w") as f:
             json.dump({"steps": self.agent.cumulative_timesteps, "epoch": self.epoch, "stage": stage}, f)
+        _sync_to_desktop()
 
     def save_checkpoint(self, label):
         path = os.path.join(self.checkpoints_folder, label)
@@ -472,6 +491,9 @@ class GPULearner:
         while len(all_ckpts) > 3:
             oldest = all_ckpts.pop(0)
             shutil.rmtree(os.path.join(self.checkpoints_folder, oldest))
+
+        # Sync to Windows desktop
+        _sync_to_desktop()
 
     def load_latest_checkpoint(self):
         """Load from GPU checkpoints first, then fall back to CPU checkpoints."""
