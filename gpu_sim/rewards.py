@@ -9,7 +9,7 @@ Reward channels (11 continuous, 5 event):
   R3: TouchQuality (event-like, with consecutive air touch multiplier)
   R4: FaceBall (continuous, closest player)
   R5: SpeedTowardBall (continuous, closest player)
-  R6: KickoffSpeed (conditional)
+  R6: KickoffTime (one-time, time-to-hit based)
   R7: BoostPickup (event-like)
   R8: DefensivePos (conditional, support players)
   R9: AggressionBias (flat constant, stages 3+)
@@ -23,12 +23,12 @@ ZealanL PPO Guide (staged curriculum), Kaiyo-bot (consecutive air touches).
 import torch
 from .constants import (
     BALL_MAX_SPEED, CAR_MAX_SPEED, BACK_NET_Y,
-    GOAL_HEIGHT, BLUE_GOAL_BACK, ORANGE_GOAL_BACK,
+    GOAL_HEIGHT, BLUE_GOAL_BACK, ORANGE_GOAL_BACK, DT,
 )
 
 # ── Reward weights per stage ──
 # [P1:BallGoalPot, P2:VelGoalPot, R3:TouchQual, R4:FaceBall, R5:SpeedToBall,
-#  R6:Kickoff, R7:BoostPickup, R8:DefPos, R9:AggrBias, R10:Air, R11:BoostSave]
+#  R6:KickoffTime, R7:BoostPickup, R8:DefPos, R9:AggrBias, R10:Air, R11:BoostSave]
 STAGE_WEIGHTS = {
     0: [0.0, 0.0, 5.0, 1.0, 2.5, 3.0, 0.5, 0.0, 0.0, 0.0,  0.05],
     1: [2.0, 1.5, 4.0, 1.5, 1.5, 2.0, 0.5, 0.0, 0.0, 0.0,  0.1],
@@ -71,6 +71,7 @@ class GPURewards:
 
         # Kickoff state
         self.is_kickoff = torch.zeros(n_envs, dtype=torch.bool, device=device)
+        self.kickoff_timer = torch.zeros(n_envs, device=device)  # seconds since kickoff
 
         # Previous boost for R7
         self.prev_player_boost = torch.zeros(n_envs, n_agents, device=device)
@@ -148,6 +149,7 @@ class GPURewards:
             (torch.abs(bp[:, 1]) < 50) &
             (bp[:, 2] < 120)
         )
+        self.kickoff_timer[mask] = 0.0
 
         self.prev_player_boost[mask] = s.car_boost[mask]
 
@@ -266,14 +268,26 @@ class GPURewards:
             dist_gate = (to_ball_dist / 500.0).clamp(max=1.0)  # 0 at ball, 1 at 500+
             rewards += weights[4] * (speed_toward_ball * dist_gate * is_closest.float())
 
-        # ── R6: KickoffSpeed ──
+        # ── R6: KickoffTime — one-time reward based on time to hit ball ──
+        # Equation: R(t) = (20/3)(3.5 - t), clamped to [-10, +10]
+        #   Meta kickoff (t ≤ 2.0s): +10, Average (3.5s): 0, Slow (t ≥ 5.0s): -10
+        # No continuous component — R4/R5 provide approach guidance.
+        # Per-tick drain makes "never hitting" the worst possible outcome.
+        was_kickoff = self.is_kickoff.clone()
+        self.is_kickoff = self.is_kickoff & (ball_speed < 100)
+        kickoff_just_ended = was_kickoff & ~self.is_kickoff  # (E,)
+
         if weights[5] > 0:
-            self.is_kickoff = self.is_kickoff & (ball_speed < 100)
-            kick_speed = (s.car_vel * to_ball_dir).sum(dim=-1)
-            kick_r = (kick_speed / CAR_MAX_SPEED).clamp(min=0) + torch.exp(-to_ball_dist / 800.0)
-            rewards += weights[5] * (kick_r * self.is_kickoff.unsqueeze(1).float())
-        else:
-            self.is_kickoff = self.is_kickoff & (ball_speed < 100)
+            # Anti-exploit drain: -0.01/tick ≈ -0.6/s, -36 over a 60s episode
+            rewards -= 0.01 * was_kickoff.unsqueeze(1).float()
+
+            # One-time time-based reward when ball is hit
+            if kickoff_just_ended.any():
+                time_r = ((20.0 / 3.0) * (3.5 - self.kickoff_timer)).clamp(-10.0, 10.0)
+                rewards += time_r.unsqueeze(1) * kickoff_just_ended.unsqueeze(1).float()
+
+        # Timer always increments for active kickoffs (tick_skip=1 → 120Hz)
+        self.kickoff_timer += DT * was_kickoff.float()
 
         # ── R7: BoostPickup ──
         if weights[6] > 0:
