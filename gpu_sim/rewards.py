@@ -30,8 +30,8 @@ from .constants import (
 # [P1:BallGoalPot, P2:VelGoalPot, R3:TouchQual, R4:FaceBall, R5:SpeedToBall,
 #  R6:Kickoff, R7:BoostPickup, R8:DefPos, R9:AggrBias, R10:Air, R11:BoostSave]
 STAGE_WEIGHTS = {
-    0: [0.0, 0.0, 3.0, 1.0, 2.5, 3.0, 0.5, 0.0, 0.0, 0.0,  0.15],
-    1: [2.0, 1.5, 2.5, 1.5, 1.5, 2.0, 0.5, 0.0, 0.0, 0.0,  0.15],
+    0: [0.0, 0.0, 5.0, 1.0, 2.5, 3.0, 0.5, 0.0, 0.0, 0.0,  0.05],
+    1: [2.0, 1.5, 4.0, 1.5, 1.5, 2.0, 0.5, 0.0, 0.0, 0.0,  0.1],
     2: [3.0, 2.0, 3.0, 1.0, 1.0, 2.0, 0.5, 0.0, 0.0, 0.2,  0.2],
     3: [4.0, 3.0, 3.0, 0.5, 0.5, 2.0, 1.0, 0.5, 0.2, 0.15, 0.25],
     4: [5.0, 3.5, 3.0, 0.3, 0.3, 1.5, 1.0, 1.0, 0.2, 0.1,  0.25],
@@ -40,7 +40,7 @@ STAGE_WEIGHTS = {
 
 # [GoalScored, TeamScore, OppScore, Demo, Touched]
 EVENT_WEIGHTS = {
-    0: [ 0.0,  0.0,   0.0, 0.0, 1.0],  # NO goal rewards. Only touch.
+    0: [ 0.0,  0.0,   0.0, 0.0, 3.0],  # NO goal rewards. Strong touch.
     1: [ 5.0,  3.0,  -5.0, 0.0, 0.3],  # Light goal rewards
     2: [ 8.0,  5.0,  -7.0, 0.0, 0.2],  # Moderate goal rewards
     3: [10.0,  7.0,  -8.0, 3.0, 0.1],  # Full goal + demo rewards
@@ -253,16 +253,18 @@ class GPURewards:
 
             rewards += weights[2] * (touched * height_mult * speed_factor * wall_factor * effective_mult)
 
-        # ── R4: FaceBall (pure facing, closest player) ──
+        # ── R4: FaceBall (distance-gated: fades to 0 within 500uu) ──
         if weights[3] > 0:
             facing_ball = (s.car_fwd * to_ball_dir).sum(dim=-1).clamp(min=0)
-            rewards += weights[3] * (facing_ball * is_closest.float())
+            dist_gate = (to_ball_dist / 500.0).clamp(max=1.0)  # 0 at ball, 1 at 500+
+            rewards += weights[3] * (facing_ball * dist_gate * is_closest.float())
 
-        # ── R5: SpeedTowardBall (pure speed, closest player) ──
+        # ── R5: SpeedTowardBall (distance-gated: fades to 0 within 500uu) ──
         if weights[4] > 0:
             speed_toward_ball = (s.car_vel * to_ball_dir).sum(dim=-1) / CAR_MAX_SPEED
             speed_toward_ball = speed_toward_ball.clamp(min=0)
-            rewards += weights[4] * (speed_toward_ball * is_closest.float())
+            dist_gate = (to_ball_dist / 500.0).clamp(max=1.0)  # 0 at ball, 1 at 500+
+            rewards += weights[4] * (speed_toward_ball * dist_gate * is_closest.float())
 
         # ── R6: KickoffSpeed ──
         if weights[5] > 0:
