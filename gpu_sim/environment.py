@@ -13,7 +13,8 @@ from .constants import (
     BALL_RADIUS, GOAL_HALF_WIDTH, GOAL_HEIGHT, BACK_NET_Y,
     BOOST_PAD_POSITIONS, N_BOOST_PADS, N_LARGE_PADS,
     LARGE_PAD_BOOST, SMALL_PAD_BOOST, LARGE_PAD_RESPAWN, SMALL_PAD_RESPAWN,
-    BOOST_PAD_PICKUP_RADIUS, CAR_MAX_SPEED, DT, PHYSICS_HZ,
+    BOOST_PAD_PICKUP_RADIUS_BIG, BOOST_PAD_PICKUP_RADIUS_SMALL,
+    CAR_MAX_SPEED, DT, PHYSICS_HZ,
     KICKOFF_POSITIONS, KICKOFF_YAWS, STAGE_CONFIG, get_agent_layout,
 )
 from .physics import (
@@ -58,6 +59,11 @@ class GPUEnvironment:
         self._pad_amount = torch.zeros(N_BOOST_PADS, device=device)
         self._pad_amount[:N_LARGE_PADS] = LARGE_PAD_BOOST
         self._pad_amount[N_LARGE_PADS:] = SMALL_PAD_BOOST
+
+        # Per-pad pickup radius (big=160, small=120)
+        self._pad_radius = torch.zeros(N_BOOST_PADS, device=device)
+        self._pad_radius[:N_LARGE_PADS] = BOOST_PAD_PICKUP_RADIUS_BIG
+        self._pad_radius[N_LARGE_PADS:] = BOOST_PAD_PICKUP_RADIUS_SMALL
 
         # Kickoff positions and yaws on device
         self._kickoff_pos = KICKOFF_POSITIONS.to(device)
@@ -112,6 +118,16 @@ class GPUEnvironment:
         s.car_vel[mask] = 0.0
         s.car_ang_vel[mask] = 0.0
         s.car_surface_normal[mask] = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+
+        # Reset new physics fields
+        s.car_handbrake_val[mask] = 0.0
+        s.car_is_flipping[mask] = 0.0
+        s.car_flip_time[mask] = 0.0
+        s.car_flip_rel_torque[mask] = 0.0
+        s.car_is_supersonic[mask] = 0.0
+        s.car_supersonic_time[mask] = 0.0
+        s.car_autoflip_timer[mask] = 0.0
+        s.car_autoflip_torque_scale[mask] = 0.0
 
         # Reset scores
         s.blue_score[mask] = 0
@@ -919,7 +935,9 @@ class GPUEnvironment:
         diff = car_xy.unsqueeze(2) - pad_xy  # (E, A, 34, 2)
         dist = diff.norm(dim=-1)  # (E, A, 34)
 
-        in_range = dist < BOOST_PAD_PICKUP_RADIUS
+        # Per-pad pickup radius (big=160, small=120)
+        pad_radius = self._pad_radius.unsqueeze(0).unsqueeze(0)  # (1, 1, 34)
+        in_range = dist < pad_radius
         available = s.boost_pad_timers.unsqueeze(1) <= 0
         can_pickup = in_range & available & alive.unsqueeze(2)
 

@@ -11,11 +11,17 @@ from .constants import (
     CAR_SUPERSONIC_SPEED, DEMO_RESPAWN_TIME,
     CAR_HITBOX_LENGTH, CAR_HITBOX_WIDTH, CAR_HITBOX_HEIGHT, CAR_HITBOX_OFFSET,
     BALL_MASS, CAR_MASS, BALL_RESTITUTION,
+    BALL_CAR_EXTRA_IMPULSE_Z_SCALE, BALL_CAR_EXTRA_IMPULSE_FWD_SCALE,
+    BALL_CAR_EXTRA_IMPULSE_SPEEDS, BALL_CAR_EXTRA_IMPULSE_FACTORS,
+    BUMP_GROUND_SPEEDS, BUMP_GROUND_FACTORS,
+    BUMP_AIR_SPEEDS, BUMP_AIR_FACTORS,
+    BUMP_UPWARD_SPEEDS, BUMP_UPWARD_FACTORS,
 )
-from .utils import quat_rotate_vector, quat_conjugate
+from .utils import quat_rotate_vector, quat_conjugate, piecewise_linear
 
 # ── Cached hitbox constants (created once per device) ──
 _hitbox_cache = {}
+_collision_curves = {}
 
 
 def _get_hitbox_tensors(device):
@@ -30,6 +36,22 @@ def _get_hitbox_tensors(device):
             ], dtype=torch.float32, device=device),
         }
     return _hitbox_cache[device]
+
+
+def _get_collision_curves(device):
+    """Lazily create and cache collision curve tensors."""
+    if device not in _collision_curves:
+        _collision_curves[device] = {
+            'extra_speeds': torch.tensor(BALL_CAR_EXTRA_IMPULSE_SPEEDS, device=device),
+            'extra_factors': torch.tensor(BALL_CAR_EXTRA_IMPULSE_FACTORS, device=device),
+            'bump_ground_speeds': torch.tensor(BUMP_GROUND_SPEEDS, device=device),
+            'bump_ground_factors': torch.tensor(BUMP_GROUND_FACTORS, device=device),
+            'bump_air_speeds': torch.tensor(BUMP_AIR_SPEEDS, device=device),
+            'bump_air_factors': torch.tensor(BUMP_AIR_FACTORS, device=device),
+            'bump_upward_speeds': torch.tensor(BUMP_UPWARD_SPEEDS, device=device),
+            'bump_upward_factors': torch.tensor(BUMP_UPWARD_FACTORS, device=device),
+        }
+    return _collision_curves[device]
 
 
 def ball_car_collision(state):
@@ -105,6 +127,21 @@ def ball_car_collision(state):
     ball_dv = (j / BALL_MASS).unsqueeze(-1) * normal   # (E, A, 3)
     car_dv = -(j / CAR_MASS).unsqueeze(-1) * normal    # (E, A, 3)
 
+    # ── RocketSim extra impulse on ball ──
+    curves = _get_collision_curves(state.device)
+    car_speed = state.car_vel.norm(dim=-1)  # (E, A)
+    extra_factor = piecewise_linear(car_speed, curves['extra_speeds'], curves['extra_factors'])
+
+    # Forward-adjusted impulse direction
+    car_fwd = state.car_fwd  # (E, A, 3)
+    extra_dir = normal.clone()
+    extra_dir = extra_dir + car_fwd * BALL_CAR_EXTRA_IMPULSE_FWD_SCALE
+    extra_dir[:, :, 2] = extra_dir[:, :, 2] * BALL_CAR_EXTRA_IMPULSE_Z_SCALE
+    extra_dir = extra_dir / (extra_dir.norm(dim=-1, keepdim=True) + 1e-6)
+
+    extra_impulse = extra_dir * (car_speed * extra_factor).unsqueeze(-1)  # (E, A, 3)
+    ball_dv = ball_dv + extra_impulse
+
     active_f = active.unsqueeze(-1).float()  # (E, A, 1)
 
     # Apply impulse to ball (sum across all colliding cars)
@@ -159,7 +196,7 @@ def car_car_collision(state):
         if not colliding.any():
             continue
 
-        # Demo check: opposite teams + supersonic speed
+        # Demo check: opposite teams + supersonic state (uses hysteresis tracking)
         diff_team = state.car_team[:, i] != state.car_team[:, j]
         speed_i = state.car_vel[:, i].norm(dim=-1)
         speed_j = state.car_vel[:, j].norm(dim=-1)
@@ -168,8 +205,11 @@ def car_car_collision(state):
         approaching_i = (state.car_vel[:, i] * (-normal)).sum(dim=-1) > 0
         approaching_j = (state.car_vel[:, j] * normal).sum(dim=-1) > 0
 
-        demo_j = colliding & diff_team & (speed_i > CAR_SUPERSONIC_SPEED) & approaching_i
-        demo_i = colliding & diff_team & (speed_j > CAR_SUPERSONIC_SPEED) & approaching_j
+        # Use supersonic state flag (with hysteresis) for demo eligibility
+        ss_i = state.car_is_supersonic[:, i] > 0.5
+        ss_j = state.car_is_supersonic[:, j] > 0.5
+        demo_j = colliding & diff_team & ss_i & approaching_i
+        demo_i = colliding & diff_team & ss_j & approaching_j
 
         if demo_j.any():
             state.car_is_demoed[:, j] = torch.where(demo_j, torch.ones_like(state.car_is_demoed[:, j]),
@@ -187,9 +227,10 @@ def car_car_collision(state):
             state.car_vel[demo_i, i] = 0.0
             state.match_demos[:, j] += demo_i.float()
 
-        # Bump physics (non-demo collisions)
+        # Bump physics (non-demo collisions) with speed-dependent curves
         bump = colliding & ~demo_i & ~demo_j
         if bump.any():
+            curves = _get_collision_curves(state.device)
             normal_dir = diff / (dist.unsqueeze(-1) + 1e-6)
             rel_vel = state.car_vel[:, i] - state.car_vel[:, j]
             rel_speed_normal = (rel_vel * normal_dir).sum(dim=-1)
@@ -198,7 +239,22 @@ def car_car_collision(state):
             active_bump = bump & approaching
 
             if active_bump.any():
-                bump_impulse = -0.8 * rel_speed_normal.unsqueeze(-1) * normal_dir
+                # Speed-dependent bump factor
+                avg_speed = (speed_i + speed_j) * 0.5
+                on_ground_i = state.car_on_ground[:, i] > 0.5
+                on_ground_j = state.car_on_ground[:, j] > 0.5
+                both_ground = on_ground_i & on_ground_j
+
+                # Choose curve based on ground/air state and normal direction
+                upward = normal_dir[:, 2] > 0.5
+                ground_factor = piecewise_linear(avg_speed, curves['bump_ground_speeds'], curves['bump_ground_factors'])
+                air_factor = piecewise_linear(avg_speed, curves['bump_air_speeds'], curves['bump_air_factors'])
+                upward_factor = piecewise_linear(avg_speed, curves['bump_upward_speeds'], curves['bump_upward_factors'])
+
+                bump_factor = torch.where(both_ground, ground_factor,
+                              torch.where(upward, upward_factor, air_factor))
+
+                bump_impulse = -rel_speed_normal.unsqueeze(-1) * normal_dir * bump_factor.unsqueeze(-1)
                 bump_f = active_bump.unsqueeze(-1).float()
                 state.car_vel[:, i] += bump_impulse * 0.5 * bump_f
                 state.car_vel[:, j] -= bump_impulse * 0.5 * bump_f

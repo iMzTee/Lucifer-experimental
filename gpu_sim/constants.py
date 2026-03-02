@@ -23,6 +23,8 @@ BALL_MAX_SPEED = 6000.0
 BALL_RESTITUTION = 0.6       # bounce coefficient
 BALL_DRAG = 0.03             # per-second drag factor
 BALL_MASS = 30.0             # relative mass for collision (180/6)
+BALL_FRICTION = 0.35          # surface friction coefficient
+BALL_MAX_ANG_SPEED = 6.0      # rad/s angular velocity cap
 
 # ── Car (Octane) ──
 CAR_HITBOX_LENGTH = 120.507  # full hitbox dimensions
@@ -40,6 +42,7 @@ CAR_WHEELBASE = 85.0          # front_wheel_x - rear_wheel_x
 THROTTLE_ACCEL = 1600.0       # uu/s² peak throttle acceleration (at 0 speed)
 BRAKE_ACCEL = 3500.0          # uu/s² braking deceleration
 COAST_DECEL = 525.0           # uu/s² coasting deceleration (no throttle)
+COASTING_BRAKE_FACTOR = 0.15  # fraction of BRAKE_ACCEL for coasting (0.15*3500=525)
 STOPPING_SPEED = 25.0         # uu/s below which car fully stops
 
 # Throttle torque factor curve: piecewise linear (speed → factor)
@@ -61,6 +64,15 @@ STEER_ANGLE_VALUES = [0.53356, 0.31930, 0.18203, 0.10570, 0.08507, 0.03454]
 POWERSLIDE_STEER_SPEEDS = [0.0, 2500.0]
 POWERSLIDE_STEER_VALUES = [0.39235, 0.12610]
 
+# Lateral friction curves (slip-angle model)
+LAT_FRICTION_CURVE_X = [0.0, 1.0]            # slip ratio breakpoints
+LAT_FRICTION_CURVE_Y = [1.0, 0.2]            # friction factor at each slip ratio
+HANDBRAKE_LAT_FRICTION_FACTOR = 0.1           # multiply lat friction when full handbrake
+
+# Handbrake analog lerp rates
+HANDBRAKE_RISE_RATE = 5.0     # per-second rise when holding
+HANDBRAKE_FALL_RATE = 2.0     # per-second fall when released
+
 # ── Air car physics ──
 PITCH_TORQUE = 12.46          # rad/s² pitch (130 * CAR_TORQUE_SCALE)
 YAW_TORQUE = 9.11             # rad/s² yaw (95 * CAR_TORQUE_SCALE)
@@ -74,18 +86,59 @@ ROLL_ANG_DAMPING = 4.794      # 50 * CAR_TORQUE_SCALE
 AIR_THROTTLE_ACCEL = 66.667   # uu/s² air throttle (200/3)
 CAR_MAX_ANG_SPEED = 5.5       # rad/s max angular velocity magnitude
 
+# Auto-roll (corrective torque toward surface-aligned orientation)
+CAR_AUTOROLL_FORCE = 100.0    # uu/s² (not used directly, informational)
+CAR_AUTOROLL_TORQUE = 80.0    # rad/s² corrective roll torque on ground
+
+# Sticky forces (keep car attached to surface)
+STICKY_FORCE_GROUND = 0.5     # base sticky force multiplier
+
 # ── Jump / flip ──
 JUMP_IMPULSE = 291.667        # uu/s upward impulse on first jump (875/3)
 JUMP_HOLD_FORCE = 1458.333    # uu/s² sustained upward force while holding (4375/3)
 JUMP_HOLD_TIME = 0.2          # seconds max hold duration
+JUMP_MIN_TIME = 0.025         # seconds: force scale reduced during this window
+JUMP_MIN_FORCE_SCALE = 0.62   # force multiplier during first JUMP_MIN_TIME
 FLIP_IMPULSE = 500.0          # uu/s base horizontal dodge velocity
 FLIP_FORWARD_SCALE = 1.0      # dodge impulse scale: forward
 FLIP_SIDE_SCALE = 1.9         # dodge impulse scale: sideways
 FLIP_BACKWARD_SCALE = 2.5     # dodge impulse scale: backward
 FLIP_BACKWARD_X_SCALE = 16.0 / 15.0  # extra backward multiplier (1.067)
 FLIP_Z_DAMP = 0.05            # Z velocity multiplier on dodge (~0.65^7)
+FLIP_Z_DAMP_PER_TICK = 0.65   # per-tick Z damping during gradual window
+FLIP_Z_DAMP_START = 0.15      # seconds after flip: start gradual Z damp
+FLIP_Z_DAMP_END = 0.21        # seconds after flip: end gradual Z damp
 FLIP_TIMER = 1.25             # seconds after jump before flip expires
+FLIP_TORQUE_X = 260.0         # rad/s² flip torque around X axis (roll/yaw)
+FLIP_TORQUE_Y = 224.0         # rad/s² flip torque around Y axis (pitch)
+FLIP_TORQUE_TIME = 0.65       # seconds of active flip torque
+FLIP_PITCH_LOCK_TIME = 0.95   # seconds of air pitch lock after flip
 DEMO_RESPAWN_TIME = 3.0       # seconds until respawn after demo
+
+# Auto-flip recovery
+CAR_AUTOFLIP_ROLL_THRESH = 2.8     # radians: |roll| threshold to trigger
+CAR_AUTOFLIP_TORQUE = 500.0        # rad/s² recovery torque
+CAR_AUTOFLIP_TIME = 0.4            # seconds for recovery
+
+# Supersonic tracking (hysteresis)
+CAR_SUPERSONIC_ACTIVATE = 2200.0   # speed to activate supersonic
+CAR_SUPERSONIC_MAINTAIN = 2100.0   # speed threshold to maintain
+CAR_SUPERSONIC_MAINTAIN_TIME = 1.0 # seconds to maintain below threshold
+
+# Ball-car extra impulse (RocketSim)
+BALL_CAR_EXTRA_IMPULSE_Z_SCALE = 0.35         # Z component scale
+BALL_CAR_EXTRA_IMPULSE_FWD_SCALE = 0.65       # forward adjustment
+BALL_CAR_EXTRA_IMPULSE_MAX_SPEED_RATIO = 0.3  # max ratio at high speeds
+BALL_CAR_EXTRA_IMPULSE_SPEEDS = [0.0, 500.0, 2300.0, 4600.0]
+BALL_CAR_EXTRA_IMPULSE_FACTORS = [0.65, 0.65, 0.55, 0.30]
+
+# Bump velocity curves (speed-dependent bump amounts)
+BUMP_GROUND_SPEEDS = [0.0, 500.0, 2300.0]
+BUMP_GROUND_FACTORS = [0.5, 0.5, 0.3]
+BUMP_AIR_SPEEDS = [0.0, 500.0, 2300.0]
+BUMP_AIR_FACTORS = [0.7, 0.7, 0.4]
+BUMP_UPWARD_SPEEDS = [0.0, 500.0, 2300.0]
+BUMP_UPWARD_FACTORS = [0.6, 0.6, 0.35]
 
 # Gravity
 GRAVITY = -650.0              # uu/s² downward
@@ -138,7 +191,9 @@ LARGE_PAD_BOOST = 1.0        # full boost
 SMALL_PAD_BOOST = 0.12       # 12% boost
 LARGE_PAD_RESPAWN = 10.0     # seconds
 SMALL_PAD_RESPAWN = 4.0      # seconds
-BOOST_PAD_PICKUP_RADIUS = 160.0  # pickup distance (generous)
+BOOST_PAD_PICKUP_RADIUS = 160.0  # pickup distance (legacy, uniform)
+BOOST_PAD_PICKUP_RADIUS_BIG = 160.0    # big pad pickup radius
+BOOST_PAD_PICKUP_RADIUS_SMALL = 120.0  # small pad pickup radius
 
 # ── Observation / Reward constants ──
 POS_COEF = 1.0 / 2300.0

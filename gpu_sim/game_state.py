@@ -62,6 +62,20 @@ class TensorState:
 
         # Handbrake state (set by physics, read by arena friction)
         self.car_handbrake = torch.zeros(E, A, device=device)
+        self.car_handbrake_val = torch.zeros(E, A, device=device)  # analog 0-1
+
+        # Flip torque state
+        self.car_is_flipping = torch.zeros(E, A, device=device)       # active flip torque window
+        self.car_flip_time = torch.zeros(E, A, device=device)         # time since flip started
+        self.car_flip_rel_torque = torch.zeros(E, A, 3, device=device)  # stored flip torque direction
+
+        # Supersonic state
+        self.car_is_supersonic = torch.zeros(E, A, device=device)     # supersonic flag
+        self.car_supersonic_time = torch.zeros(E, A, device=device)   # time spent supersonic
+
+        # Auto-flip recovery
+        self.car_autoflip_timer = torch.zeros(E, A, device=device)    # auto-flip countdown
+        self.car_autoflip_torque_scale = torch.zeros(E, A, device=device)  # +1/-1 direction
 
         # Team assignment from layout
         self.car_team = torch.tensor(

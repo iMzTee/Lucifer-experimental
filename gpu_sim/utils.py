@@ -128,3 +128,19 @@ def safe_normalize(v, dim=-1, eps=1e-6):
     """Normalize vectors, returning zero for zero-length vectors."""
     n = v.norm(dim=dim, keepdim=True)
     return v / (n + eps)
+
+
+def piecewise_linear(x, bp_x, bp_y):
+    """Vectorized piecewise linear interpolation.
+
+    x: arbitrary-shape tensor of query values
+    bp_x: (N,) sorted breakpoints (1D tensor on same device)
+    bp_y: (N,) corresponding values
+    Returns: tensor same shape as x with interpolated values.
+    """
+    idx = torch.searchsorted(bp_x, x.contiguous())
+    idx = idx.clamp(1, len(bp_x) - 1)
+    x0, x1 = bp_x[idx - 1], bp_x[idx]
+    y0, y1 = bp_y[idx - 1], bp_y[idx]
+    t = ((x - x0) / (x1 - x0)).clamp(0, 1)
+    return y0 + t * (y1 - y0)

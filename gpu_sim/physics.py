@@ -10,22 +10,31 @@ import torch
 from .constants import (
     GRAVITY, CAR_MAX_SPEED, BALL_MAX_SPEED, BALL_DRAG,
     THROTTLE_ACCEL, BRAKE_ACCEL, BOOST_ACCEL_GROUND, BOOST_ACCEL_AIR,
-    BOOST_CONSUMPTION, COAST_DECEL, STOPPING_SPEED,
+    BOOST_CONSUMPTION, COASTING_BRAKE_FACTOR, STOPPING_SPEED,
     CAR_WHEELBASE, CAR_MAX_ANG_SPEED,
     THROTTLE_TORQUE_SPEEDS, THROTTLE_TORQUE_FACTORS,
     STEER_ANGLE_SPEEDS, STEER_ANGLE_VALUES,
     POWERSLIDE_STEER_SPEEDS, POWERSLIDE_STEER_VALUES,
+    HANDBRAKE_RISE_RATE, HANDBRAKE_FALL_RATE,
     PITCH_TORQUE, YAW_TORQUE, ROLL_TORQUE,
     PITCH_ANG_DAMPING, YAW_ANG_DAMPING, ROLL_ANG_DAMPING,
-    AIR_THROTTLE_ACCEL,
+    AIR_THROTTLE_ACCEL, CAR_AUTOROLL_TORQUE,
+    STICKY_FORCE_GROUND,
     JUMP_IMPULSE, JUMP_HOLD_FORCE, JUMP_HOLD_TIME,
+    JUMP_MIN_TIME, JUMP_MIN_FORCE_SCALE,
     FLIP_IMPULSE, FLIP_FORWARD_SCALE, FLIP_SIDE_SCALE,
     FLIP_BACKWARD_SCALE, FLIP_BACKWARD_X_SCALE, FLIP_Z_DAMP,
-    FLIP_TIMER, DEMO_RESPAWN_TIME, DT,
+    FLIP_Z_DAMP_PER_TICK, FLIP_Z_DAMP_START, FLIP_Z_DAMP_END,
+    FLIP_TIMER, FLIP_TORQUE_X, FLIP_TORQUE_Y, FLIP_TORQUE_TIME,
+    FLIP_PITCH_LOCK_TIME,
+    CAR_AUTOFLIP_ROLL_THRESH, CAR_AUTOFLIP_TORQUE, CAR_AUTOFLIP_TIME,
+    CAR_SUPERSONIC_ACTIVATE, CAR_SUPERSONIC_MAINTAIN, CAR_SUPERSONIC_MAINTAIN_TIME,
+    DEMO_RESPAWN_TIME, DT,
 )
 from .utils import (
     quat_integrate, quat_to_fwd_up, safe_normalize,
     quat_from_axis_angle, quat_multiply, quat_normalize,
+    piecewise_linear,
 )
 
 # ── Cached curve tensors (created once per device, avoid per-tick GPU alloc) ──
@@ -46,20 +55,7 @@ def _get_curves(device):
     return _curve_cache[device]
 
 
-def _piecewise_linear(x, bp_x, bp_y):
-    """Vectorized piecewise linear interpolation.
-
-    x: arbitrary-shape tensor of query values
-    bp_x: (N,) sorted breakpoints (1D tensor on same device)
-    bp_y: (N,) corresponding values
-    Returns: tensor same shape as x with interpolated values.
-    """
-    idx = torch.searchsorted(bp_x, x.contiguous())
-    idx = idx.clamp(1, len(bp_x) - 1)
-    x0, x1 = bp_x[idx - 1], bp_x[idx]
-    y0, y1 = bp_y[idx - 1], bp_y[idx]
-    t = ((x - x0) / (x1 - x0)).clamp(0, 1)
-    return y0 + t * (y1 - y0)
+_piecewise_linear = piecewise_linear  # local alias
 
 
 def apply_car_controls(state, actions, dt=DT):
@@ -84,6 +80,16 @@ def apply_car_controls(state, actions, dt=DT):
     handbrake = actions[:, :, 7]
     state.car_handbrake = handbrake
 
+    # ── Handbrake analog lerp (rise at 5/s, fall at 2/s) ──
+    hb_val = state.car_handbrake_val
+    hb_rising = handbrake > 0.5
+    hb_val = torch.where(
+        hb_rising,
+        (hb_val + HANDBRAKE_RISE_RATE * dt).clamp(max=1.0),
+        (hb_val - HANDBRAKE_FALL_RATE * dt).clamp(min=0.0),
+    )
+    state.car_handbrake_val = hb_val
+
     on_ground = state.car_on_ground > 0.5    # (E, A) bool
     in_air = ~on_ground
 
@@ -106,11 +112,16 @@ def apply_car_controls(state, actions, dt=DT):
     state.car_vel += ground_accel * dt * on_ground.unsqueeze(-1).float()
 
     # ── Coasting deceleration (no throttle → friction slows car) ──
-    coast_mask = (torch.abs(throttle) < 0.01) & on_ground & (abs_speed > STOPPING_SPEED)
-    coast_amount = COAST_DECEL * dt
-    # Reduce forward speed by coast_amount, clamped to not overshoot zero
+    coast_mask = (torch.abs(throttle) < 0.01) & on_ground
+    coast_accel = COASTING_BRAKE_FACTOR * BRAKE_ACCEL
+    coast_amount = coast_accel * dt
+    # Full stop when speed < 25 uu/s
+    full_stop = coast_mask & (abs_speed < STOPPING_SPEED)
+    state.car_vel[full_stop] = 0.0
+    # Decelerate when above stopping speed
+    coast_decel_mask = coast_mask & (abs_speed >= STOPPING_SPEED)
     coast_decel = torch.sign(forward_speed) * torch.clamp(abs_speed, max=coast_amount)
-    state.car_vel -= (coast_decel * coast_mask.float()).unsqueeze(-1) * fwd
+    state.car_vel -= (coast_decel * coast_decel_mask.float()).unsqueeze(-1) * fwd
 
     # ── Steering: speed-dependent steer angle curve ──
     steer_angle = _piecewise_linear(
@@ -137,10 +148,14 @@ def apply_car_controls(state, actions, dt=DT):
     # ── Air physics ──
     air_mask = in_air.float()  # (E, A)
 
+    # Lock air pitch input during flip pitch lock window (0.95s after flip)
+    pitch_locked = (state.car_has_flipped > 0.5) & (state.car_flip_time < FLIP_PITCH_LOCK_TIME)
+    effective_pitch = torch.where(pitch_locked, torch.zeros_like(pitch_in), pitch_in)
+
     # Air torques (in car's local frame axes)
     air_torque = torch.stack([
         roll_in * ROLL_TORQUE,
-        pitch_in * PITCH_TORQUE,
+        effective_pitch * PITCH_TORQUE,
         yaw_in * YAW_TORQUE,
     ], dim=-1)  # (E, A, 3)
 
@@ -202,6 +217,38 @@ def apply_car_controls(state, actions, dt=DT):
     state.car_vel += state.car_surface_normal * grav * on_ground_f.unsqueeze(-1)
     state.car_vel[:, :, 2] += grav * (1.0 - on_ground_f)
 
+    # ── Sticky forces: keep car attached to surface when throttling ──
+    throttling = torch.abs(throttle) > 0.01
+    sticky_mask = on_ground & throttling & alive
+    if sticky_mask.any():
+        up_z = state.car_up[:, :, 2]  # (E, A)
+        sticky_strength = STICKY_FORCE_GROUND + (1.0 - torch.abs(up_z))
+        sticky_force = state.car_surface_normal * (sticky_strength * (-GRAVITY) * dt).unsqueeze(-1)
+        state.car_vel += sticky_force * sticky_mask.unsqueeze(-1).float()
+
+    # ── Auto-roll: corrective torque toward surface-aligned orientation ──
+    if on_ground.any():
+        # Compute the car's right vector
+        car_right = torch.cross(state.car_up, state.car_fwd, dim=-1)  # (E, A, 3)
+        # How much the car's right vector deviates from surface plane
+        # The surface normal component of the right vector
+        right_surf = (car_right * state.car_surface_normal).sum(dim=-1)  # (E, A)
+        # Apply corrective roll torque proportional to misalignment
+        autoroll_torque = -right_surf * CAR_AUTOROLL_TORQUE  # (E, A)
+        # Apply along forward direction (roll axis)
+        autoroll_mask = on_ground & throttling & alive
+        state.car_ang_vel += (autoroll_torque.unsqueeze(-1) * state.car_fwd * dt
+                              * autoroll_mask.unsqueeze(-1).float())
+
+    # ── Flip torque (feature 3): apply continuous torque during flip ──
+    _apply_flip_torque(state, pitch_in, dt)
+
+    # ── Supersonic tracking (feature 14): hysteresis model ──
+    _update_supersonic(state, dt)
+
+    # ── Auto-flip recovery (feature 13) ──
+    _apply_autoflip(state, jump, dt)
+
     # ── Speed cap ──
     speed = state.car_vel.norm(dim=-1, keepdim=True)  # (E, A, 1)
     state.car_vel *= torch.where(speed > CAR_MAX_SPEED, CAR_MAX_SPEED / speed.clamp(min=1e-6), 1.0)
@@ -261,7 +308,14 @@ def _apply_jump_flip(state, jump_input, pitch_in, yaw_in, forward_speed, dt):
         alive
     )
     if holding_jump.any():
-        state.car_vel += (state.car_surface_normal * JUMP_HOLD_FORCE * dt * holding_jump.unsqueeze(-1).float())
+        # Jump pre-min scale: first 0.025s uses 62% force
+        jump_scale = torch.where(
+            state.car_jump_timer < JUMP_MIN_TIME,
+            JUMP_MIN_FORCE_SCALE,
+            1.0,
+        )
+        state.car_vel += (state.car_surface_normal * JUMP_HOLD_FORCE * jump_scale.unsqueeze(-1) * dt
+                          * holding_jump.unsqueeze(-1).float())
 
     # Release jump button → end jump hold
     released = (~jump_pressed) & (state.car_is_jumping > 0.5)
@@ -321,8 +375,7 @@ def _apply_jump_flip(state, jump_input, pitch_in, yaw_in, forward_speed, dt):
         double_jump = can_flip & (~has_dir)
         state.car_vel[:, :, 2] += JUMP_IMPULSE * double_jump.float()
 
-        # ── Flip Z-damp: heavily reduce Z velocity on directional dodge ──
-        # RocketSim applies 0.65 damping per tick for ~7 ticks ≈ 0.05 total
+        # ── Flip Z-damp: initial clamp on directional dodge ──
         dodge_z_mask = can_flip & has_dir
         state.car_vel[:, :, 2] = torch.where(
             dodge_z_mask,
@@ -338,9 +391,40 @@ def _apply_jump_flip(state, jump_input, pitch_in, yaw_in, forward_speed, dt):
         state.car_has_flip[can_flip] = 0.0
         state.car_is_jumping[can_flip] = 0.0
 
+        # ── Store flip torque direction for continuous torque ──
+        # Torque: pitch component on Y-axis, yaw component on X-axis (roll)
+        flip_torque_dir = torch.zeros_like(state.car_flip_rel_torque)  # (E, A, 3)
+        # X-axis torque (roll) from yaw input of dodge
+        flip_torque_dir[:, :, 0] = dodge_dir_x * FLIP_TORQUE_X
+        # Y-axis torque (pitch) from pitch input of dodge
+        flip_torque_dir[:, :, 1] = dodge_dir_y * FLIP_TORQUE_Y
+        # Store only for cars that did a directional flip
+        dir_flip = (can_flip & has_dir).unsqueeze(-1).float()
+        state.car_flip_rel_torque = torch.where(
+            dir_flip > 0.5,
+            flip_torque_dir,
+            state.car_flip_rel_torque,
+        )
+        state.car_is_flipping[can_flip & has_dir] = 1.0
+        state.car_flip_time[can_flip] = 0.0
+
     # ── Update jump timer ──
     has_jumped = state.car_has_jumped > 0.5
     state.car_jump_timer += dt * has_jumped.float()
+
+    # ── Update flip time for flip torque and Z-damp ──
+    has_flipped = state.car_has_flipped > 0.5
+    state.car_flip_time += dt * has_flipped.float()
+
+    # ── Gradual flip Z-damp (feature 7): apply during 0.15-0.21s window ──
+    in_zdamp_window = has_flipped & (state.car_flip_time >= FLIP_Z_DAMP_START) & (state.car_flip_time <= FLIP_Z_DAMP_END)
+    if in_zdamp_window.any():
+        zdamp_factor = FLIP_Z_DAMP_PER_TICK ** (dt * 120.0)  # scale for dt
+        state.car_vel[:, :, 2] = torch.where(
+            in_zdamp_window,
+            state.car_vel[:, :, 2] * zdamp_factor,
+            state.car_vel[:, :, 2],
+        )
 
     # Expire flip after 1.25s
     flip_expired = has_jumped & (~on_ground) & (state.car_jump_timer > FLIP_TIMER) & (state.car_has_flipped < 0.5)
@@ -424,5 +508,128 @@ def update_demoed_cars(state, dt=DT):
     state.car_jump_timer[respawn] = 0.0
     state.car_on_ground[respawn] = 1.0
 
+    # Reset new flip/supersonic/autoflip state
+    state.car_is_flipping[respawn] = 0.0
+    state.car_flip_time[respawn] = 0.0
+    state.car_flip_rel_torque[respawn] = 0.0
+    state.car_handbrake_val[respawn] = 0.0
+    state.car_is_supersonic[respawn] = 0.0
+    state.car_supersonic_time[respawn] = 0.0
+    state.car_autoflip_timer[respawn] = 0.0
+    state.car_autoflip_torque_scale[respawn] = 0.0
+
     # Reset orientation to upright, facing appropriate direction
     state.car_quat[respawn] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=state.device)
+
+
+def _apply_flip_torque(state, pitch_in, dt):
+    """Apply continuous flip torque during the flip torque window (0.65s).
+
+    Includes flip cancel: if pitch input opposes flip direction, scale torque down.
+    """
+    flipping = state.car_is_flipping > 0.5
+    if not flipping.any():
+        return
+
+    # End flip torque after FLIP_TORQUE_TIME
+    torque_expired = flipping & (state.car_flip_time > FLIP_TORQUE_TIME)
+    state.car_is_flipping[torque_expired] = 0.0
+
+    active = flipping & (state.car_flip_time <= FLIP_TORQUE_TIME)
+    if not active.any():
+        return
+
+    # Get stored torque direction (in car-local frame)
+    torque = state.car_flip_rel_torque  # (E, A, 3) — [roll_torque, pitch_torque, 0]
+
+    # Flip cancel: if pitch input matches flip direction, scale torque Y by (1 - |pitch|)
+    # "matches" means same sign as the dodge pitch direction (stored in torque Y)
+    flip_pitch_dir = torque[:, :, 1]  # positive = forward flip
+    same_dir = (pitch_in * flip_pitch_dir) > 0  # pitch input matches flip direction
+    cancel_scale = torch.where(
+        same_dir,
+        (1.0 - torch.abs(pitch_in)),
+        torch.ones_like(pitch_in),
+    )
+
+    # Apply cancel only to Y (pitch) component of torque
+    scaled_torque = torque.clone()
+    scaled_torque[:, :, 1] = torque[:, :, 1] * cancel_scale
+
+    # Convert car-local torque to world-space angular velocity delta
+    fwd = state.car_fwd   # (E, A, 3)
+    right = torch.cross(state.car_up, fwd, dim=-1)  # (E, A, 3)
+    up = state.car_up     # (E, A, 3)
+
+    world_torque = (
+        scaled_torque[:, :, 0:1] * fwd +     # roll component along forward
+        scaled_torque[:, :, 1:2] * right +    # pitch component along right
+        scaled_torque[:, :, 2:3] * up         # yaw component along up (usually 0)
+    )
+
+    active_f = active.unsqueeze(-1).float()
+    state.car_ang_vel += world_torque * dt * active_f
+
+
+def _update_supersonic(state, dt):
+    """Update supersonic state with hysteresis model.
+
+    Activate at 2200 uu/s, maintain down to 2100 for up to 1s.
+    """
+    speed = state.car_vel.norm(dim=-1)  # (E, A)
+    alive = state.car_is_demoed < 0.5
+    is_ss = state.car_is_supersonic > 0.5
+
+    # Activate supersonic
+    activate = (~is_ss) & (speed >= CAR_SUPERSONIC_ACTIVATE) & alive
+    state.car_is_supersonic[activate] = 1.0
+    state.car_supersonic_time[activate] = 0.0
+
+    # Maintain supersonic: above maintain threshold → reset timer
+    maintaining = is_ss & (speed >= CAR_SUPERSONIC_MAINTAIN)
+    state.car_supersonic_time[maintaining] = 0.0
+
+    # Below maintain threshold → count time
+    below = is_ss & (speed < CAR_SUPERSONIC_MAINTAIN)
+    state.car_supersonic_time += dt * below.float()
+
+    # Deactivate if below threshold too long or too slow
+    deactivate = is_ss & (state.car_supersonic_time > CAR_SUPERSONIC_MAINTAIN_TIME)
+    state.car_is_supersonic[deactivate] = 0.0
+    state.car_supersonic_time[deactivate] = 0.0
+
+
+def _apply_autoflip(state, jump_input, dt):
+    """Auto-flip recovery when upside down on surface + jump pressed.
+
+    If |roll| > 2.8 rad and on ground and jump pressed, apply recovery torque.
+    """
+    on_ground = state.car_on_ground > 0.5
+    alive = state.car_is_demoed < 0.5
+    jump_pressed = jump_input > 0.5
+
+    # Compute roll angle from car_up Z component
+    # When upside down, car_up.z < 0, and we can estimate roll from acos
+    up_z = state.car_up[:, :, 2]  # (E, A)
+    # Approximate roll: if up.z < cos(2.8) ≈ -0.942, car is nearly upside down
+    upside_down = up_z < -0.942  # corresponds to |roll| > ~2.8 rad
+
+    # Active autoflip timer
+    autoflip_active = state.car_autoflip_timer > 0
+
+    # Start autoflip
+    can_start = on_ground & upside_down & jump_pressed & alive & (~autoflip_active)
+    if can_start.any():
+        state.car_autoflip_timer[can_start] = CAR_AUTOFLIP_TIME
+        # Determine roll direction (+1 or -1) based on car's right lean
+        right_vec = torch.cross(state.car_up, state.car_fwd, dim=-1)
+        lean = right_vec[:, :, 2]  # positive = leaning right
+        state.car_autoflip_torque_scale[can_start] = torch.where(
+            lean[can_start] >= 0, -1.0, 1.0)
+
+    # Apply autoflip torque
+    if autoflip_active.any():
+        torque = state.car_autoflip_torque_scale * CAR_AUTOFLIP_TORQUE  # (E, A)
+        state.car_ang_vel[:, :, 0] += torque * dt * autoflip_active.float()
+        state.car_autoflip_timer -= dt * autoflip_active.float()
+        state.car_autoflip_timer.clamp_(min=0.0)
